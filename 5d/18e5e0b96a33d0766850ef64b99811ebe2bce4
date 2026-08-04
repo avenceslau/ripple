@@ -1,0 +1,21 @@
+src/analysis.rs
+  s_f42f20d5f76fb6::t_d171d68a2f69c1 37-53,59-99,155-160,430,433-434,436-437,465-572
+src/main.rs
+  s_f42f20d5f76fb6::t_980a80a48efbb6 1064-1074,1091-1098,1103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5d18e5e0b96a33d0766850ef64b99811ebe2bce4",
+  "prompts": {},
+  "sessions": {
+    "s_f42f20d5f76fb6": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fce8f-d15a-7031-8978-bf49814374da",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
