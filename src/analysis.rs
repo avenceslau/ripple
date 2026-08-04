@@ -34,11 +34,69 @@ pub fn find_change_seeds(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
+            let mut input_paths = vec![change.path.clone()];
+            if let ChangeKind::Renamed { old_path } = &change.kind {
+                input_paths.push(root.join(old_path));
+            }
+            for path in input_paths {
+                let input = Node::new(normalize_path(path), crate::parser::MODULE_INIT);
+                let referenced = graph
+                    .edges
+                    .values()
+                    .chain(graph.type_edges.values())
+                    .any(|dependencies| dependencies.contains(&input));
+                if referenced {
+                    result.nodes.insert(input.clone());
+                    result.type_nodes.insert(input);
+                }
+            }
+
             let package_owner = package_for_path(packages, &change.path);
             let is_rust_source = change
                 .path
                 .extension()
                 .is_some_and(|extension| extension == "rs");
+            let is_root_js_lockfile = change.path.parent() == Some(root)
+                && matches!(
+                    file_name,
+                    "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb"
+                );
+            if is_root_js_lockfile {
+                let details = describe_direct_input(root, base, change)?;
+                for target in &graph.targets {
+                    result
+                        .direct_packages
+                        .entry(target.package.clone())
+                        .or_default()
+                        .insert(change.path.clone(), details.clone());
+                }
+                continue;
+            }
+
+            let was_package_manifest = file_name == "package.json"
+                || matches!(
+                    &change.kind,
+                    ChangeKind::Renamed { old_path }
+                        if old_path.file_name().is_some_and(|name| name == "package.json")
+                );
+            let has_current_manifest_owner = package_owner.is_some_and(|package| {
+                change
+                    .path
+                    .parent()
+                    .is_some_and(|parent| parent == package.dir)
+            });
+            if was_package_manifest && !has_current_manifest_owner {
+                let details = describe_direct_input(root, base, change)?;
+                for target in &graph.targets {
+                    result
+                        .direct_packages
+                        .entry(target.package.clone())
+                        .or_default()
+                        .insert(change.path.clone(), details.clone());
+                }
+                continue;
+            }
+
             let is_root_cargo_input = change.path.parent() == Some(root)
                 && matches!(file_name, "Cargo.toml" | "Cargo.lock");
             let is_unowned_cargo_input = package_owner.is_some_and(|package| package.dir == root)
@@ -94,19 +152,12 @@ pub fn find_change_seeds(
                         .entry(package.name.clone())
                         .or_default()
                         .insert(change.path.clone(), details);
-                    if file_name != "package.json" {
-                        for (path, module) in graph
-                            .modules
-                            .iter()
-                            .filter(|(path, _)| path.starts_with(&package.dir))
-                        {
-                            add_all_symbols(
-                                &mut result.nodes,
-                                &mut result.type_nodes,
-                                path,
-                                module,
-                            );
-                        }
+                    for (path, module) in graph
+                        .modules
+                        .iter()
+                        .filter(|(path, _)| path.starts_with(&package.dir))
+                    {
+                        add_all_symbols(&mut result.nodes, &mut result.type_nodes, path, module);
                     }
                 }
             }
@@ -376,9 +427,14 @@ fn add_all_symbols(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::parser::MODULE_INIT;
+    use crate::workspace::Target;
 
     #[test]
     fn seeds_only_changed_declaration() {
@@ -405,5 +461,113 @@ mod tests {
 
         assert!(seeds.contains(&Node::new("shared.ts", "used")));
         assert!(!seeds.contains(&Node::new("shared.ts", "untouched")));
+    }
+
+    #[test]
+    fn seeds_imported_non_source_inputs() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        let stylesheet = root.path().join("style.css");
+        fs::write(&app, "import './style.css'; export const value = true;").unwrap();
+        fs::write(&stylesheet, "body { color: red; }").unwrap();
+        let target = Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        };
+        let graph = DependencyGraph::build(&[app], &[target], &[]).unwrap();
+        let changes = vec![ChangedFile {
+            path: stylesheet.clone(),
+            kind: ChangeKind::Modified,
+        }];
+
+        let seeds = find_change_seeds(root.path(), "HEAD", &changes, &[], &graph, None).unwrap();
+
+        assert!(
+            seeds
+                .nodes
+                .contains(&Node::new(normalize_path(stylesheet), MODULE_INIT))
+        );
+    }
+
+    #[test]
+    fn package_manifest_changes_seed_library_symbols() {
+        let root = tempdir().unwrap();
+        let shared_dir = root.path().join("shared");
+        fs::create_dir_all(&shared_dir).unwrap();
+        let shared_dir = normalize_path(shared_dir);
+        let shared = shared_dir.join("index.ts");
+        let manifest = shared_dir.join("package.json");
+        fs::write(&shared, "export const value = true;").unwrap();
+        fs::write(&manifest, r#"{"name":"shared"}"#).unwrap();
+        let package = Package {
+            name: "shared".to_string(),
+            dir: shared_dir,
+            scripts: BTreeMap::new(),
+            entrypoint: Some(shared.clone()),
+            exports: BTreeMap::new(),
+            dependencies: BTreeSet::new(),
+        };
+        let graph = DependencyGraph::build(
+            std::slice::from_ref(&shared),
+            &[],
+            std::slice::from_ref(&package),
+        )
+        .unwrap();
+        let changes = vec![ChangedFile {
+            path: manifest,
+            kind: ChangeKind::Added,
+        }];
+
+        let seeds =
+            find_change_seeds(root.path(), "HEAD", &changes, &[package], &graph, None).unwrap();
+
+        assert!(
+            seeds
+                .nodes
+                .contains(&Node::new(normalize_path(shared), "value"))
+        );
+    }
+
+    #[test]
+    fn deleted_unowned_manifest_affects_every_target() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        let deleted_manifest = root.path().join("removed/package.json");
+        fs::write(&app, "export const value = true;").unwrap();
+        let target = Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        };
+        let graph = DependencyGraph::build(&[app], &[target], &[]).unwrap();
+        let changes = vec![ChangedFile {
+            path: deleted_manifest,
+            kind: ChangeKind::Deleted,
+        }];
+
+        let seeds = find_change_seeds(root.path(), "HEAD", &changes, &[], &graph, None).unwrap();
+
+        assert!(seeds.direct_packages.contains_key("app"));
+    }
+
+    #[test]
+    fn root_lockfile_changes_affect_every_target() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        let lockfile = root.path().join("pnpm-lock.yaml");
+        fs::write(&app, "export const value = true;").unwrap();
+        fs::write(&lockfile, "lockfileVersion: '9.0'").unwrap();
+        let target = Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        };
+        let graph = DependencyGraph::build(&[app], &[target], &[]).unwrap();
+        let changes = vec![ChangedFile {
+            path: lockfile,
+            kind: ChangeKind::Added,
+        }];
+
+        let seeds = find_change_seeds(root.path(), "HEAD", &changes, &[], &graph, None).unwrap();
+
+        assert!(seeds.direct_packages.contains_key("app"));
     }
 }

@@ -1061,9 +1061,17 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     let packages = discover_packages(root)?;
     let mut graph = build_graph(root, &query.target, query.no_cache, query.cache_report)?;
     let changes = changed_files(root, &query.base)?;
-    let needs_base_graph = changes
-        .iter()
-        .any(|change| monoripple::parser::is_source_file(&change.path));
+    let needs_base_graph = changes.iter().any(|change| {
+        monoripple::parser::is_source_file(&change.path)
+            || matches!(
+                change.kind,
+                monoripple::git::ChangeKind::Deleted | monoripple::git::ChangeKind::Renamed { .. }
+            )
+            || change
+                .path
+                .file_name()
+                .is_some_and(|name| name == "package.json")
+    });
     let base_snapshot = needs_base_graph
         .then(|| extract_revision(root, &query.base))
         .transpose()?;
@@ -1080,12 +1088,19 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         let file_name = change.path.file_name().and_then(|name| name.to_str());
         if matches!(
             file_name,
-            Some("pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "Cargo.lock")
+            Some(
+                "pnpm-lock.yaml"
+                    | "package-lock.json"
+                    | "yarn.lock"
+                    | "bun.lock"
+                    | "bun.lockb"
+                    | "Cargo.lock"
+            )
         ) {
             graph.diagnostics.push(Diagnostic {
                 code: "MONORIPPLE_LOCKFILE_CHANGE_UNMODELED",
                 severity: Severity::Warning,
-                message: "lockfile changes are not yet linked to their runtime consumers"
+                message: "lockfile changes conservatively affect targets because exact runtime consumers are not modeled"
                     .to_string(),
                 path: Some(change.path.clone()),
                 members: Vec::new(),
