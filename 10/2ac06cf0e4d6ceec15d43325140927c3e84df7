@@ -1,0 +1,31 @@
+Cargo.lock
+  s_e2d9b329fb3c56::t_2184e840aba627 1-2143
+src/main.rs
+  s_b9683c0dd1ede5::t_4e55437ec6493a 1-1262
+src/ui.rs
+  s_b9683c0dd1ede5::t_f2297f2448a58f 1-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "102ac06cf0e4d6ceec15d43325140927c3e84df7",
+  "prompts": {},
+  "sessions": {
+    "s_b9683c0dd1ede5": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fce42-9bf3-7d7f-bbbe-31333d5d38ec",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    },
+    "s_e2d9b329fb3c56": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fbeb0-a30e-7fc6-ab33-0e04b693ba2c",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
