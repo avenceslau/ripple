@@ -1,0 +1,33 @@
+[package]
+name = "monoripple"
+version = "0.0.2"
+edition = "2024"
+rust-version = "1.92"
+description = "Symbol-aware affected target detection for JavaScript and TypeScript monorepos"
+license = "MIT"
+readme = "README.md"
+keywords = ["monorepo", "dependencies", "affected", "typescript", "javascript"]
+categories = ["command-line-utilities", "development-tools"]
+documentation = "https://docs.rs/monoripple"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.54", features = ["derive"] }
+crossterm = "0.28.1"
+globset = "0.4.18"
+ignore = "0.4.25"
+json5 = "0.4.1"
+oxc_allocator = "=0.120.0"
+oxc_ast = "=0.120.0"
+oxc_parser = "=0.120.0"
+oxc_resolver = "=11.13.1"
+oxc_semantic = "=0.120.0"
+oxc_span = "=0.120.0"
+oxc_syntax = "=0.120.0"
+path-clean = "1.0.1"
+ratatui = "0.29.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tar = "0.4.44"
+tempfile = "3.24.0"
