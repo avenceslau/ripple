@@ -61,7 +61,12 @@ pub fn find_change_seeds(
                     file_name,
                     "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb"
                 );
-            if is_root_js_lockfile {
+            let is_workspace_config =
+                change.path.parent() == Some(root) && file_name == "pnpm-workspace.yaml";
+            let is_root_tsconfig = change.path.parent() == Some(root)
+                && file_name.starts_with("tsconfig")
+                && file_name.ends_with(".json");
+            if is_root_js_lockfile || is_workspace_config || is_root_tsconfig {
                 let details = describe_direct_input(root, base, change)?;
                 for target in &graph.targets {
                     result
@@ -137,13 +142,9 @@ pub fn find_change_seeds(
                         .any(|component| component.as_os_str() == "src");
                 let is_build_input = matches!(
                     file_name,
-                    "package.json"
-                        | "wrangler.json"
-                        | "wrangler.jsonc"
-                        | "tsconfig.json"
-                        | "Cargo.toml"
-                        | "build.rs"
-                ) || file_name.starts_with("vite.config.");
+                    "package.json" | "wrangler.json" | "wrangler.jsonc" | "Cargo.toml" | "build.rs"
+                ) || file_name.starts_with("vite.config.")
+                    || (file_name.starts_with("tsconfig") && file_name.ends_with(".json"));
 
                 if is_rust_source || is_build_input {
                     let details = describe_direct_input(root, base, change)?;

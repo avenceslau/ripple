@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::Value;
@@ -34,6 +35,7 @@ struct PackageJson {
     module: Option<String>,
     source: Option<String>,
     exports: Option<Value>,
+    workspaces: Option<WorkspaceConfig>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default, rename = "devDependencies")]
@@ -44,8 +46,23 @@ struct PackageJson {
     optional_dependencies: BTreeMap<String, String>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkspaceConfig {
+    Patterns(Vec<String>),
+    Object { packages: Vec<String> },
+}
+
+#[derive(Deserialize)]
+struct PnpmWorkspace {
+    #[serde(default)]
+    packages: Vec<String>,
+}
+
 pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
+    let workspace_matchers = workspace_matchers(root)?;
     let mut packages = Vec::new();
+    let mut package_names = BTreeMap::new();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .filter_entry(|entry| {
@@ -64,6 +81,23 @@ pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
             && entry.file_name() == "package.json"
         {
             let dir = entry.path().parent().unwrap_or(root).to_path_buf();
+            if dir != root
+                && let Some(matchers) = &workspace_matchers
+            {
+                let relative = dir.strip_prefix(root).unwrap_or(&dir);
+                let included = matchers
+                    .iter()
+                    .filter(|(excluded, _)| !excluded)
+                    .any(|(_, matcher)| matcher.is_match(relative));
+                let excluded = matchers
+                    .iter()
+                    .filter(|(excluded, _)| *excluded)
+                    .any(|(_, matcher)| matcher.is_match(relative));
+                if !included || excluded {
+                    continue;
+                }
+            }
+
             let source = fs::read_to_string(entry.path())
                 .with_context(|| format!("failed to read {}", entry.path().display()))?;
             let manifest: PackageJson = serde_json::from_str(&source)
@@ -74,6 +108,14 @@ pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
                     .unwrap_or("root")
                     .to_string()
             });
+            if let Some(previous) = package_names.insert(name.clone(), dir.clone()) {
+                bail!(
+                    "duplicate workspace package name `{name}` in {} and {}",
+                    previous.display(),
+                    dir.display()
+                );
+            }
+
             let entrypoint = find_entrypoint(
                 &dir,
                 manifest.source.as_deref(),
@@ -105,15 +147,67 @@ pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
     Ok(packages)
 }
 
+fn workspace_matchers(root: &Path) -> Result<Option<Vec<(bool, GlobMatcher)>>> {
+    let root_manifest = root.join("package.json");
+    let mut patterns = if root_manifest.is_file() {
+        let source = fs::read_to_string(&root_manifest)
+            .with_context(|| format!("failed to read {}", root_manifest.display()))?;
+        let manifest: PackageJson = serde_json::from_str(&source)
+            .with_context(|| format!("failed to parse {}", root_manifest.display()))?;
+        manifest.workspaces.map(|workspaces| match workspaces {
+            WorkspaceConfig::Patterns(patterns) => patterns,
+            WorkspaceConfig::Object { packages } => packages,
+        })
+    } else {
+        None
+    };
+
+    let pnpm_workspace = root.join("pnpm-workspace.yaml");
+    if pnpm_workspace.is_file() {
+        let source = fs::read_to_string(&pnpm_workspace)
+            .with_context(|| format!("failed to read {}", pnpm_workspace.display()))?;
+        let workspace: PnpmWorkspace = serde_yaml::from_str(&source)
+            .with_context(|| format!("failed to parse {}", pnpm_workspace.display()))?;
+        patterns.get_or_insert_default().extend(workspace.packages);
+    }
+
+    patterns
+        .map(|patterns| {
+            patterns
+                .into_iter()
+                .map(|pattern| {
+                    let (excluded, pattern) = pattern
+                        .strip_prefix('!')
+                        .map_or((false, pattern.as_str()), |pattern| (true, pattern));
+                    let matcher = GlobBuilder::new(pattern.trim_end_matches('/'))
+                        .literal_separator(true)
+                        .build()
+                        .with_context(|| format!("invalid workspace pattern `{pattern}`"))?
+                        .compile_matcher();
+                    Ok((excluded, matcher))
+                })
+                .collect()
+        })
+        .transpose()
+}
+
 pub fn discover_source_files(root: &Path, packages: &[Package]) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    let root_path = root.to_path_buf();
+    let package_dirs: BTreeSet<_> = packages.iter().map(|package| package.dir.clone()).collect();
     let walker = WalkBuilder::new(root)
         .hidden(false)
-        .filter_entry(|entry| {
-            !matches!(
+        .filter_entry(move |entry| {
+            if matches!(
                 entry.file_name().to_str(),
                 Some(".git" | "node_modules" | "target" | "dist" | "build" | "tests" | "test")
-            )
+            ) {
+                return false;
+            }
+
+            entry.path() == root_path
+                || !entry.path().join("package.json").is_file()
+                || package_dirs.contains(entry.path())
         })
         .build();
 
@@ -146,10 +240,19 @@ pub fn targets_for(packages: &[Package], script: &str) -> Vec<Target> {
 }
 
 pub fn package_for_path<'a>(packages: &'a [Package], path: &Path) -> Option<&'a Package> {
-    packages
+    let package = packages
         .iter()
         .filter(|package| path.starts_with(&package.dir))
-        .max_by_key(|package| package.dir.components().count())
+        .max_by_key(|package| package.dir.components().count())?;
+    let manifest_owner = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .find(|directory| directory.join("package.json").is_file());
+
+    manifest_owner
+        .is_none_or(|directory| directory == package.dir)
+        .then_some(package)
 }
 
 fn find_entrypoint(
@@ -231,9 +334,12 @@ fn package_exports(dir: &Path, exports: Option<&Value>) -> BTreeMap<String, Path
 fn export_path(value: &Value) -> Option<&str> {
     match value {
         Value::String(path) => Some(path),
-        Value::Object(conditions) => ["source", "import", "default", "types"]
-            .into_iter()
-            .find_map(|condition| conditions.get(condition).and_then(export_path)),
+        Value::Object(conditions) => [
+            "source", "worker", "workerd", "browser", "import", "module", "default", "types",
+            "require",
+        ]
+        .into_iter()
+        .find_map(|condition| conditions.get(condition).and_then(export_path)),
         Value::Array(options) => options.iter().find_map(export_path),
         _ => None,
     }
@@ -268,5 +374,124 @@ mod tests {
         let targets = targets_for(&packages, "deploy");
         assert_eq!(targets[0].package, "worker");
         assert!(targets[0].entrypoint.ends_with("apps/worker/src/index.ts"));
+    }
+
+    #[test]
+    fn honors_package_json_workspace_patterns() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("apps/web/src")).unwrap();
+        fs::create_dir_all(root.path().join("fixtures/example/src")).unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"root","workspaces":["apps/*"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("apps/web/package.json"),
+            r#"{"name":"web"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("fixtures/example/package.json"),
+            r#"{"name":"example"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("apps/web/src/index.ts"),
+            "export const web = true;",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("fixtures/example/src/index.ts"),
+            "export const fixture = true;",
+        )
+        .unwrap();
+
+        let packages = discover_packages(root.path()).unwrap();
+        let names: Vec<_> = packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["root", "web"]);
+        let files = discover_source_files(root.path(), &packages);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("apps/web/src/index.ts"));
+        assert!(
+            package_for_path(
+                &packages,
+                &root.path().join("fixtures/example/src/index.ts")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn honors_pnpm_workspace_exclusions() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("packages/included")).unwrap();
+        fs::create_dir_all(root.path().join("packages/excluded")).unwrap();
+        fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("packages/included/package.json"),
+            r#"{"name":"included"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("packages/excluded/package.json"),
+            r#"{"name":"excluded"}"#,
+        )
+        .unwrap();
+
+        let packages = discover_packages(root.path()).unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "included");
+    }
+
+    #[test]
+    fn rejects_duplicate_workspace_package_names() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("packages/one")).unwrap();
+        fs::create_dir_all(root.path().join("packages/two")).unwrap();
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for package in ["one", "two"] {
+            fs::write(
+                root.path().join(format!("packages/{package}/package.json")),
+                r#"{"name":"duplicate"}"#,
+            )
+            .unwrap();
+        }
+
+        let error = discover_packages(root.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate workspace package name")
+        );
+    }
+
+    #[test]
+    fn selects_source_conditions_for_wildcard_exports() {
+        let dir = Path::new("package");
+        let exports = serde_json::json!({
+            "./*": {
+                "worker": "./src/*.ts",
+                "default": "./dist/*.js"
+            }
+        });
+
+        let exports = package_exports(dir, Some(&exports));
+
+        assert_eq!(exports["./*"], Path::new("package/src/*.ts"));
     }
 }
