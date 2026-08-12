@@ -1,0 +1,49 @@
+.gitignore
+  s_b9683c0dd1ede5::t_ca462c11efe878 1-2
+Cargo.lock
+  s_b9683c0dd1ede5::t_1260963038b940 1-2143
+Cargo.toml
+  s_b9683c0dd1ede5::t_e4d31b9d53f1eb 1-33
+README.md
+  s_b9683c0dd1ede5::t_d49d1c20e5169c 1-159
+src/analysis.rs
+  s_b9683c0dd1ede5::t_46580921597af9 1-409
+src/cache.rs
+  s_b9683c0dd1ede5::t_bc803eed1b6a91 1-14
+src/diagnostics.rs
+  s_b9683c0dd1ede5::t_74d492ffba071e 1-121
+src/git.rs
+  s_b9683c0dd1ede5::t_5fdbe1b67067a6 1-144
+src/graph.rs
+  s_b9683c0dd1ede5::t_aac519635d8cc7 1-1393
+src/lib.rs
+  s_b9683c0dd1ede5::t_1e153af50312bd 1-10
+src/main.rs
+  s_b9683c0dd1ede5::t_adc92b307d65f1 1-1262
+src/parser.rs
+  s_b9683c0dd1ede5::t_3536b1e2e2d2f9 1-568
+src/plugin.rs
+  s_b9683c0dd1ede5::t_35bfbd6788981b 1-179
+src/ui.rs
+  s_b9683c0dd1ede5::t_01d1d8ee95ce42 1-176
+src/viz.rs
+  s_b9683c0dd1ede5::t_151a61023880ff 1-810
+src/workspace.rs
+  s_b9683c0dd1ede5::t_8f3e0de368d874 1-272
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6f14ce75b140bcc578bb134ab85b013e483fd382",
+  "prompts": {},
+  "sessions": {
+    "s_b9683c0dd1ede5": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fce42-9bf3-7d7f-bbbe-31333d5d38ec",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
