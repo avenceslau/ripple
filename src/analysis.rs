@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::git::{ChangeKind, ChangedFile, file_at};
 use crate::graph::{DependencyGraph, Node, normalize_path};
-use crate::parser::{ParsedModule, is_source_file, parse_module};
+use crate::parser::{ParsedModule, is_source_file, is_test_file, parse_module};
 use crate::workspace::{Package, package_for_path};
 
 #[derive(Clone, Debug, Default)]
@@ -170,10 +170,11 @@ pub fn find_change_seeds(
                 .path
                 .strip_prefix(&package.dir)
                 .unwrap_or(&change.path);
-            let is_runtime_source = relative
-                .components()
-                .any(|component| component.as_os_str() == "src")
-                || package.entrypoint.as_ref() == Some(&change.path);
+            let is_runtime_source = !is_test_file(relative)
+                && (relative
+                    .components()
+                    .any(|component| component.as_os_str() == "src")
+                    || package.entrypoint.as_ref() == Some(&change.path));
             let is_unlinked_target = graph
                 .targets
                 .iter()
