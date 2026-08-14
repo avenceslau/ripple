@@ -48,6 +48,13 @@ pub struct ReExport {
     pub imported: ImportedName,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeLoad {
+    pub source: String,
+    pub consumers: BTreeSet<String>,
+    pub location: SourceLocation,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ParsedModule {
     pub symbols: BTreeMap<String, SymbolInfo>,
@@ -60,6 +67,7 @@ pub struct ParsedModule {
     pub star_exports: Vec<String>,
     pub type_star_exports: Vec<String>,
     pub module_requests: BTreeSet<String>,
+    pub runtime_loads: Vec<RuntimeLoad>,
     pub unresolved_dynamic_imports: Vec<String>,
 }
 
@@ -327,7 +335,10 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
 
     let mut module_requests = BTreeSet::new();
     for entry in &module_record.import_entries {
-        if !entry.is_type && runtime_referenced_symbols.contains(entry.local_name.name.as_str()) {
+        let local_name = entry.local_name.name.as_str();
+        let has_runtime_presence = runtime_referenced_symbols.contains(local_name)
+            || !type_referenced_symbols.contains(local_name);
+        if !entry.is_type && has_runtime_presence {
             module_requests.insert(entry.module_request.name.to_string());
         }
     }
@@ -355,6 +366,7 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
             module_requests.insert(name.to_string());
         }
     }
+    let mut runtime_load_spans = Vec::new();
     let mut unresolved_dynamic_imports = Vec::new();
     for import in &module_record.dynamic_imports {
         if let Some(request) =
@@ -363,10 +375,17 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
             let quoted = (request.starts_with('\'') && request.ends_with('\''))
                 || (request.starts_with('"') && request.ends_with('"'));
             if quoted {
-                module_requests.insert(request[1..request.len() - 1].to_string());
+                runtime_load_spans.push((request[1..request.len() - 1].to_string(), import.span));
             } else {
                 unresolved_dynamic_imports.push(request.to_string());
             }
+        }
+    }
+    for node in semantic.nodes().iter() {
+        if let AstKind::CallExpression(call) = node.kind()
+            && let Some(request) = call.common_js_require()
+        {
+            runtime_load_spans.push((request.value.to_string(), call.span));
         }
     }
 
@@ -388,6 +407,71 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
                 })
         })
         .collect();
+
+    let mut module_dependencies = BTreeSet::new();
+    let mut module_dependency_locations = BTreeMap::new();
+    for (symbol_id, name, _, runtime) in &top_level {
+        if !runtime {
+            continue;
+        }
+
+        let location = semantic
+            .symbol_references(*symbol_id)
+            .find_map(|reference| {
+                if reference.flags().is_type_only() {
+                    return None;
+                }
+                let span = semantic.reference_span(reference);
+                let belongs_to_declaration =
+                    declaration_statement_spans.iter().any(|statement_span| {
+                        statement_span.start <= span.start && statement_span.end >= span.end
+                    });
+                let belongs_to_export_specifier = semantic
+                    .nodes()
+                    .ancestor_kinds(reference.node_id())
+                    .any(|kind| matches!(kind, AstKind::ExportSpecifier(_)));
+                (!belongs_to_declaration && !belongs_to_export_specifier)
+                    .then(|| source_location(source, span.start as usize))
+            });
+        if let Some(location) = location {
+            module_dependencies.insert(name.clone());
+            module_dependency_locations.insert(name.clone(), location);
+        }
+    }
+    for entry in &module_record.import_entries {
+        let local_name = entry.local_name.name.as_str();
+        if !entry.is_type
+            && !runtime_referenced_symbols.contains(local_name)
+            && !type_referenced_symbols.contains(local_name)
+        {
+            let name = local_name.to_string();
+            module_dependencies.insert(name.clone());
+            module_dependency_locations.insert(
+                name,
+                source_location(source, entry.statement_span.start as usize),
+            );
+        }
+    }
+
+    let mut runtime_loads = Vec::new();
+    for (request, span) in runtime_load_spans {
+        let mut consumers: BTreeSet<_> = top_level
+            .iter()
+            .filter(|(_, _, declaration, runtime)| {
+                *runtime && declaration.start <= span.start && declaration.end >= span.end
+            })
+            .map(|(_, name, _, _)| name.clone())
+            .collect();
+        if consumers.is_empty() {
+            consumers.insert(MODULE_INIT.to_string());
+        }
+        runtime_loads.push(RuntimeLoad {
+            source: request,
+            consumers,
+            location: source_location(source, span.start as usize),
+        });
+    }
+
     let mut module_fingerprint = String::new();
     for token in &parsed.tokens {
         let span = token.span();
@@ -419,8 +503,8 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
         MODULE_INIT.to_string(),
         SymbolInfo {
             fingerprint: module_fingerprint.clone(),
-            dependencies: BTreeSet::new(),
-            dependency_locations: BTreeMap::new(),
+            dependencies: module_dependencies,
+            dependency_locations: module_dependency_locations,
             type_dependencies: BTreeSet::new(),
             type_dependency_locations: BTreeMap::new(),
             runtime: true,
@@ -438,6 +522,7 @@ pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
         star_exports,
         type_star_exports,
         module_requests,
+        runtime_loads,
         unresolved_dynamic_imports,
     })
 }
@@ -564,5 +649,39 @@ mod tests {
             module.imports["values"].imported,
             ImportedName::Namespace { members: None }
         );
+    }
+
+    #[test]
+    fn module_initialization_depends_on_top_level_references() {
+        let module = parse_module(
+            Path::new("fixture.ts"),
+            "const handler = () => 'ok'; export const router = {}; router.handler = handler;",
+        )
+        .unwrap();
+
+        assert!(module.symbols[MODULE_INIT].dependencies.contains("handler"));
+    }
+
+    #[test]
+    fn records_dynamic_import_and_commonjs_consumers() {
+        let module = parse_module(
+            Path::new("fixture.ts"),
+            "export async function load() { return import('./lazy'); } export const legacy = require('./legacy');",
+        )
+        .unwrap();
+
+        assert!(
+            module
+                .runtime_loads
+                .iter()
+                .any(|load| { load.source == "./lazy" && load.consumers.contains("load") })
+        );
+        assert!(
+            module
+                .runtime_loads
+                .iter()
+                .any(|load| { load.source == "./legacy" && load.consumers.contains("legacy") })
+        );
+        assert!(!module.module_requests.contains("./lazy"));
     }
 }

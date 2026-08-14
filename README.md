@@ -8,6 +8,8 @@ monoripple finds JavaScript and TypeScript applications affected by a change at 
 - npm-compatible workspace package manifests and package exports
 - named, default, namespace, and re-exported bindings
 - static namespace-member narrowing
+- literal dynamic imports and CommonJS `require()`
+- imported non-JavaScript assets
 - separate runtime and type dependency graphs
 - base/current graph union for deletions, renames, and removed exports
 - deploy and typecheck affected queries
@@ -137,7 +139,7 @@ Plugins are never auto-loaded from dependencies. A plugin failure is a graph err
 
 ## How it works
 
-monoripple creates declaration nodes for each module using `oxc_semantic`. References inside a declaration become edges to the exact local or imported symbols they consume. Runtime and type-only edges are retained separately. Package exports and re-exports link those symbols across files.
+monoripple creates declaration nodes for each module using `oxc_semantic`. References inside a declaration become edges to the exact local or imported symbols they consume, while top-level execution is connected through a module-initialization node. Runtime and type-only edges are retained separately. Package exports, re-exports, literal dynamic imports, CommonJS loads, and imported assets link those nodes across files.
 
 Affected traversal reverses the dependency graph:
 
@@ -152,7 +154,7 @@ The base and current graphs are combined before traversal so removed declaration
 
 ## Current boundaries
 
-- external dependency and lockfile changes are diagnosed but not yet linked to exact consumers
+- lockfile changes conservatively affect every target because external dependency changes are not yet linked to exact consumers
 - virtual and generated entrypoints need explicit plugin roots for complete precision
 - Rust source changes affect their owning target, but Cargo dependency graphs are not yet modeled
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning

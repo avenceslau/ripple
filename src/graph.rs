@@ -97,14 +97,14 @@ impl DependencyGraph {
                 .with_context(|| format!("failed to read {}", path.display()))?;
             let parsed = if let Some(cache_dir) = cache_dir {
                 let mut hasher = Sha256::new();
-                hasher.update(b"monoripple-parse-v4\0");
+                hasher.update(b"monoripple-parse-v5\0");
                 hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
                 hasher.update(b"\0oxc-0.120.0\0");
                 hasher.update(path.extension().unwrap_or_default().as_encoded_bytes());
                 hasher.update(b"\0");
                 hasher.update(source.as_bytes());
                 let key = format!("{:x}", hasher.finalize());
-                let cache_path = cache_dir.join("parse-v4").join(format!("{key}.json"));
+                let cache_path = cache_dir.join("parse-v5").join(format!("{key}.json"));
 
                 match fs::read(&cache_path)
                     .ok()
@@ -412,6 +412,17 @@ impl DependencyGraph {
                 }
             }
 
+            if let Some(load) = module.runtime_loads.iter().find(|load| {
+                load.consumers.contains(&consumer.symbol)
+                    && self.resolve(&consumer.file, &load.source).as_ref() == Some(&dependency.file)
+            }) {
+                return EdgeExplanation {
+                    detail: format!("`{}` loads `{}` at runtime", consumer.symbol, load.source),
+                    path: Some(consumer.file.clone()),
+                    location: Some(load.location),
+                };
+            }
+
             if consumer.symbol == MODULE_INIT && dependency.symbol == MODULE_INIT {
                 let request = module.module_requests.iter().find(|request| {
                     self.resolve(&consumer.file, request).as_ref() == Some(&dependency.file)
@@ -563,6 +574,39 @@ impl DependencyGraph {
                         path: Some(path.clone()),
                         members: Vec::new(),
                     });
+                }
+            }
+
+            for load in &module.runtime_loads {
+                let Some(dependency_path) = self.resolve(&path, &load.source) else {
+                    if self.request_is_internal(&load.source) {
+                        let workspace_package = self.request_is_workspace_package(&load.source);
+                        self.diagnostics.push(Diagnostic {
+                            code: if workspace_package {
+                                "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
+                            } else {
+                                "MONORIPPLE_UNRESOLVED_LOCAL_IMPORT"
+                            },
+                            severity: if workspace_package {
+                                Severity::Error
+                            } else {
+                                Severity::Warning
+                            },
+                            message: format!("cannot resolve runtime module `{}`", load.source),
+                            path: Some(path.clone()),
+                            members: Vec::new(),
+                        });
+                    }
+                    continue;
+                };
+
+                for consumer_name in &load.consumers {
+                    let consumer = Node::new(&path, consumer_name);
+                    self.add_edge(consumer.clone(), Node::new(&dependency_path, MODULE_INIT));
+                    let mut visited = BTreeSet::new();
+                    for dependency in self.all_exports(&dependency_path, &mut visited) {
+                        self.add_edge(consumer.clone(), dependency);
+                    }
                 }
             }
         }
@@ -1028,7 +1072,9 @@ impl DependencyGraph {
                     resolve_from_directory(&self.resolver, &package.dir, &format!("./{subpath}"))
                 }
             });
-            if let Some(path) = candidate.filter(|path| self.modules.contains_key(path)) {
+            if let Some(path) =
+                candidate.filter(|path| self.modules.contains_key(path) || path.is_file())
+            {
                 return Some(path);
             }
         }
@@ -1069,9 +1115,10 @@ impl DependencyGraph {
                 }
             }
 
-            return candidates
-                .into_iter()
-                .find(|candidate| self.modules.contains_key(candidate));
+            return candidates.into_iter().find_map(|candidate| {
+                let candidate = normalize_path(candidate);
+                (self.modules.contains_key(&candidate) || candidate.is_file()).then_some(candidate)
+            });
         }
 
         if !request.starts_with('/') && !request.starts_with('#') {
@@ -1079,7 +1126,7 @@ impl DependencyGraph {
         }
 
         let path = resolve_from_directory(&self.resolver, directory, request)?;
-        self.modules.contains_key(&path).then_some(path)
+        (self.modules.contains_key(&path) || path.is_file()).then_some(path)
     }
 
     fn add_edge(&mut self, consumer: Node, dependency: Node) {
@@ -1345,6 +1392,110 @@ mod tests {
             "removed",
         );
         let reached = current.affected(&BTreeSet::from([removed]));
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn reaches_target_through_top_level_execution() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        fs::write(
+            &app,
+            "const handler = () => 'ok'; export const router = {}; router.handler = handler;",
+        )
+        .unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(std::slice::from_ref(&app), &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(normalize_path(app), "handler")]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn reaches_target_through_literal_dynamic_import() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        let lazy = root.path().join("lazy.ts");
+        fs::write(
+            &app,
+            "export async function load() { return (await import('./lazy')).value; }",
+        )
+        .unwrap();
+        fs::write(&lazy, "export const value = 'old';").unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[app, lazy.clone()], &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(normalize_path(lazy), "value")]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn reaches_target_through_commonjs_require() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.cjs");
+        let dependency = root.path().join("dependency.cjs");
+        fs::write(
+            &app,
+            "const dependency = require('./dependency.cjs'); module.exports = () => dependency.value;",
+        )
+        .unwrap();
+        fs::write(&dependency, "const value = 'old'; exports.value = value;").unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[app, dependency.clone()], &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(
+            normalize_path(dependency),
+            "value",
+        )]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn reaches_target_through_imported_asset() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        let stylesheet = root.path().join("style.css");
+        fs::write(&app, "import './style.css'; export const value = true;").unwrap();
+        fs::write(&stylesheet, "body { color: red; }").unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(std::slice::from_ref(&app), &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(
+            normalize_path(stylesheet),
+            MODULE_INIT,
+        )]));
+
         assert!(
             reached
                 .reached
