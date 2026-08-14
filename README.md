@@ -5,7 +5,9 @@ monoripple finds JavaScript and TypeScript applications affected by a change at 
 ## Features
 
 - JavaScript, JSX, TypeScript, and TSX
-- npm-compatible workspace package manifests and package exports
+- npm and pnpm workspace membership with duplicate-name validation
+- exact, wildcard, and conditional package exports
+- TypeScript `baseUrl`, `paths`, extended configs, and project references
 - named, default, namespace, and re-exported bindings
 - static namespace-member narrowing
 - literal dynamic imports and CommonJS `require()`
@@ -81,7 +83,7 @@ Selecting a path step shows the node’s package, file, symbol, dependencies, an
 
 `why --ui` opens an interactive impact-path viewer using the same changed → consumer → target direction and edge explanations as the graph. Use up/down or `j`/`k` to navigate steps, left/right or `h`/`l` to switch paths, and `q` or Escape to exit. Directly affected packages list the exact changed build inputs in both text and UI modes.
 
-Warnings can be hidden or promoted to errors:
+Unresolved workspace imports and TypeScript path aliases are graph errors so an incomplete resolution graph cannot silently produce an affected set. Other warnings can be hidden or promoted to errors:
 
 ```sh
 monoripple check --warnings off
@@ -139,7 +141,7 @@ Plugins are never auto-loaded from dependencies. A plugin failure is a graph err
 
 ## How it works
 
-monoripple creates declaration nodes for each module using `oxc_semantic`. References inside a declaration become edges to the exact local or imported symbols they consume, while top-level execution is connected through a module-initialization node. Runtime and type-only edges are retained separately. Package exports, re-exports, literal dynamic imports, CommonJS loads, and imported assets link those nodes across files.
+monoripple creates declaration nodes for each module using `oxc_semantic`. References inside a declaration become edges to the exact local or imported symbols they consume, while top-level execution is connected through a module-initialization node. Runtime and type-only edges are retained separately. TypeScript path aliases, package exports, re-exports, literal dynamic imports, CommonJS loads, and imported assets link those nodes across files.
 
 Affected traversal reverses the dependency graph:
 

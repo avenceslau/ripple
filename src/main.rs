@@ -1070,7 +1070,12 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
             || change
                 .path
                 .file_name()
-                .is_some_and(|name| name == "package.json")
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "package.json"
+                        || name == "pnpm-workspace.yaml"
+                        || (name.starts_with("tsconfig") && name.ends_with(".json"))
+                })
     });
     let base_snapshot = needs_base_graph
         .then(|| extract_revision(root, &query.base))

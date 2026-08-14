@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use oxc_resolver::{ResolveOptions, Resolver};
+use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use path_clean::PathClean;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -53,6 +53,7 @@ struct WorkspacePackage {
     dir: PathBuf,
     entrypoint: Option<PathBuf>,
     exports: BTreeMap<String, PathBuf>,
+    dependencies: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -140,6 +141,7 @@ impl DependencyGraph {
         }
 
         let resolver = Resolver::new(ResolveOptions {
+            tsconfig: Some(TsconfigDiscovery::Auto),
             condition_names: vec![
                 "source".to_string(),
                 "import".to_string(),
@@ -190,6 +192,7 @@ impl DependencyGraph {
                     .iter()
                     .map(|(name, path)| (name.clone(), normalize_path(path)))
                     .collect(),
+                dependencies: package.dependencies.clone(),
             })
             .collect();
         let mut graph = Self {
@@ -552,51 +555,18 @@ impl DependencyGraph {
                         Node::new(&path, MODULE_INIT),
                         Node::new(dependency_path, MODULE_INIT),
                     );
-                } else if self.request_is_internal(request)
-                    && !module
-                        .imports
-                        .values()
-                        .any(|import| import.source == *request)
+                } else if !module
+                    .imports
+                    .values()
+                    .any(|import| import.source == *request)
                 {
-                    let workspace_package = self.request_is_workspace_package(request);
-                    self.diagnostics.push(Diagnostic {
-                        code: if workspace_package {
-                            "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
-                        } else {
-                            "MONORIPPLE_UNRESOLVED_LOCAL_IMPORT"
-                        },
-                        severity: if workspace_package {
-                            Severity::Error
-                        } else {
-                            Severity::Warning
-                        },
-                        message: format!("cannot resolve runtime module `{request}`"),
-                        path: Some(path.clone()),
-                        members: Vec::new(),
-                    });
+                    self.add_unresolved_diagnostic(&path, request);
                 }
             }
 
             for load in &module.runtime_loads {
                 let Some(dependency_path) = self.resolve(&path, &load.source) else {
-                    if self.request_is_internal(&load.source) {
-                        let workspace_package = self.request_is_workspace_package(&load.source);
-                        self.diagnostics.push(Diagnostic {
-                            code: if workspace_package {
-                                "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
-                            } else {
-                                "MONORIPPLE_UNRESOLVED_LOCAL_IMPORT"
-                            },
-                            severity: if workspace_package {
-                                Severity::Error
-                            } else {
-                                Severity::Warning
-                            },
-                            message: format!("cannot resolve runtime module `{}`", load.source),
-                            path: Some(path.clone()),
-                            members: Vec::new(),
-                        });
-                    }
+                    self.add_unresolved_diagnostic(&path, &load.source);
                     continue;
                 };
 
@@ -614,24 +584,7 @@ impl DependencyGraph {
 
     fn link_import(&mut self, path: &Path, local_name: &str, import: &ImportBinding) {
         let Some(dependency_path) = self.resolve(path, &import.source) else {
-            if self.request_is_internal(&import.source) {
-                let workspace_package = self.request_is_workspace_package(&import.source);
-                self.diagnostics.push(Diagnostic {
-                    code: if workspace_package {
-                        "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
-                    } else {
-                        "MONORIPPLE_UNRESOLVED_LOCAL_IMPORT"
-                    },
-                    severity: if workspace_package {
-                        Severity::Error
-                    } else {
-                        Severity::Warning
-                    },
-                    message: format!("cannot resolve imported module `{}`", import.source),
-                    path: Some(path.to_path_buf()),
-                    members: Vec::new(),
-                });
-            }
+            self.add_unresolved_diagnostic(path, &import.source);
             return;
         };
         let consumer = Node::new(path, local_name);
@@ -674,6 +627,7 @@ impl DependencyGraph {
 
     fn link_type_import(&mut self, path: &Path, local_name: &str, import: &ImportBinding) {
         let Some(dependency_path) = self.resolve(path, &import.source) else {
+            self.add_unresolved_diagnostic(path, &import.source);
             return;
         };
         let consumer = Node::new(path, local_name);
@@ -1033,6 +987,79 @@ impl DependencyGraph {
         self.diagnostics.dedup();
     }
 
+    fn add_unresolved_diagnostic(&mut self, importer: &Path, request: &str) {
+        let workspace_package = self.request_is_workspace_package(request);
+        let tsconfig_alias = self.request_is_tsconfig_alias(importer, request);
+        if !self.request_is_internal(request) && !tsconfig_alias {
+            return;
+        }
+
+        let code = if workspace_package {
+            "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
+        } else if tsconfig_alias {
+            "MONORIPPLE_UNRESOLVED_TSCONFIG_ALIAS"
+        } else {
+            "MONORIPPLE_UNRESOLVED_LOCAL_IMPORT"
+        };
+        self.diagnostics.push(Diagnostic {
+            code,
+            severity: if workspace_package || tsconfig_alias {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            message: format!("cannot resolve runtime module `{request}`"),
+            path: Some(importer.to_path_buf()),
+            members: Vec::new(),
+        });
+    }
+
+    fn request_is_tsconfig_alias(&self, importer: &Path, request: &str) -> bool {
+        if request.starts_with('.') || request.starts_with('/') || request.starts_with('#') {
+            return false;
+        }
+
+        let Some(directory) = importer.parent() else {
+            return false;
+        };
+        let Some(config_path) = directory
+            .ancestors()
+            .map(|directory| directory.join("tsconfig.json"))
+            .find(|path| path.is_file())
+        else {
+            return false;
+        };
+        let Ok(config) = self.resolver.resolve_tsconfig(config_path) else {
+            return false;
+        };
+        let options = config.compiler_options();
+        let matches_path = options.paths.as_ref().is_some_and(|paths| {
+            paths.keys().any(|pattern| {
+                if let Some(star) = pattern.find('*') {
+                    request.starts_with(&pattern[..star]) && request.ends_with(&pattern[star + 1..])
+                } else {
+                    request == pattern
+                }
+            })
+        });
+        if matches_path {
+            return true;
+        }
+
+        let dependency_name = if request.starts_with('@') {
+            request.split('/').take(2).collect::<Vec<_>>().join("/")
+        } else {
+            request.split('/').next().unwrap_or(request).to_string()
+        };
+        let declared_dependency = self
+            .workspace_packages
+            .iter()
+            .filter(|package| importer.starts_with(&package.dir))
+            .max_by_key(|package| package.dir.components().count())
+            .is_some_and(|package| package.dependencies.contains(&dependency_name));
+        options.base_url.is_some() && !declared_dependency
+    }
+
     fn request_is_internal(&self, request: &str) -> bool {
         request.starts_with('.')
             || request.starts_with('/')
@@ -1065,15 +1092,42 @@ impl DependencyGraph {
             } else {
                 format!("./{subpath}")
             };
-            let candidate = package.exports.get(&export_name).cloned().or_else(|| {
-                if subpath.is_empty() {
-                    package.entrypoint.clone()
-                } else {
-                    resolve_from_directory(&self.resolver, &package.dir, &format!("./{subpath}"))
-                }
-            });
-            if let Some(path) =
-                candidate.filter(|path| self.modules.contains_key(path) || path.is_file())
+            let export_pattern = package
+                .exports
+                .iter()
+                .filter_map(|(pattern, target)| {
+                    let star = pattern.find('*')?;
+                    let prefix = &pattern[..star];
+                    let suffix = &pattern[star + 1..];
+                    let matched = export_name.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                    let target = PathBuf::from(target.to_string_lossy().replace('*', matched));
+                    Some((prefix.len() + suffix.len(), target))
+                })
+                .max_by_key(|(specificity, _)| *specificity)
+                .map(|(_, target)| target);
+            let candidate = package
+                .exports
+                .get(&export_name)
+                .cloned()
+                .or(export_pattern);
+            let candidate = if package.exports.is_empty() {
+                candidate.or_else(|| {
+                    if subpath.is_empty() {
+                        package.entrypoint.clone()
+                    } else {
+                        resolve_from_directory(
+                            &self.resolver,
+                            &package.dir,
+                            &format!("./{subpath}"),
+                        )
+                    }
+                })
+            } else {
+                candidate
+            };
+            if let Some(path) = candidate
+                .map(normalize_path)
+                .filter(|path| self.modules.contains_key(path) || path.is_file())
             {
                 return Some(path);
             }
@@ -1121,12 +1175,19 @@ impl DependencyGraph {
             });
         }
 
-        if !request.starts_with('/') && !request.starts_with('#') {
-            return None;
+        let path = resolve_from_directory(&self.resolver, directory, request)?;
+        if self.modules.contains_key(&path) {
+            return Some(path);
         }
 
-        let path = resolve_from_directory(&self.resolver, directory, request)?;
-        (self.modules.contains_key(&path) || path.is_file()).then_some(path)
+        let inside_node_modules = path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules");
+        let inside_workspace = self
+            .workspace_packages
+            .iter()
+            .any(|package| path.starts_with(&package.dir));
+        (path.is_file() && inside_workspace && !inside_node_modules).then_some(path)
     }
 
     fn add_edge(&mut self, consumer: Node, dependency: Node) {
@@ -1501,6 +1562,187 @@ mod tests {
                 .reached
                 .contains(&DependencyGraph::target_node("app"))
         );
+    }
+
+    #[test]
+    fn resolves_tsconfig_paths_from_extended_config() {
+        let root = tempdir().unwrap();
+        let shared_dir = root.path().join("shared");
+        fs::create_dir_all(&shared_dir).unwrap();
+        let shared = shared_dir.join("value.ts");
+        let app = root.path().join("app.ts");
+        fs::write(
+            root.path().join("tsconfig.base.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@shared/*":["shared/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{"extends":"./tsconfig.base.json"}"#,
+        )
+        .unwrap();
+        fs::write(&shared, "export const value = true;").unwrap();
+        fs::write(
+            &app,
+            "import { value } from '@shared/value'; export default value;",
+        )
+        .unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[shared.clone(), app], &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(
+            normalize_path(shared),
+            "value",
+        )]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn resolves_package_import_aliases() {
+        let root = tempdir().unwrap();
+        let shared = root.path().join("shared.ts");
+        let app = root.path().join("app.ts");
+        fs::write(
+            root.path().join("package.json"),
+            r##"{"name":"app","imports":{"#shared":"./shared.ts"}}"##,
+        )
+        .unwrap();
+        fs::write(&shared, "export const value = true;").unwrap();
+        fs::write(
+            &app,
+            "import { value } from '#shared'; export default value;",
+        )
+        .unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[shared.clone(), app], &targets, &[]).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(
+            normalize_path(shared),
+            "value",
+        )]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn unresolved_tsconfig_alias_is_an_error() {
+        let root = tempdir().unwrap();
+        let app = root.path().join("app.ts");
+        fs::write(
+            root.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@shared/*":["shared/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &app,
+            "import { value } from '@shared/missing'; export default value;",
+        )
+        .unwrap();
+
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[app], &targets, &[]).unwrap();
+        let diagnostic = graph
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "MONORIPPLE_UNRESOLVED_TSCONFIG_ALIAS")
+            .unwrap();
+
+        assert_eq!(diagnostic.severity, Severity::Error);
+    }
+
+    #[test]
+    fn resolves_wildcard_workspace_exports() {
+        let root = tempdir().unwrap();
+        let shared_dir = root.path().join("packages/shared");
+        let app_dir = root.path().join("apps/app");
+        fs::create_dir_all(shared_dir.join("src")).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        let shared = shared_dir.join("src/feature.ts");
+        let app = app_dir.join("index.ts");
+        fs::write(&shared, "export const value = true;").unwrap();
+        fs::write(
+            &app,
+            "import { value } from 'shared/feature'; export default value;",
+        )
+        .unwrap();
+
+        let packages = vec![Package {
+            name: "shared".to_string(),
+            dir: shared_dir.clone(),
+            scripts: BTreeMap::new(),
+            entrypoint: None,
+            exports: BTreeMap::from([("./*".to_string(), shared_dir.join("src/*.ts"))]),
+            dependencies: BTreeSet::new(),
+        }];
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[shared.clone(), app], &targets, &packages).unwrap();
+        let reached = graph.affected(&BTreeSet::from([Node::new(
+            normalize_path(shared),
+            "value",
+        )]));
+
+        assert!(
+            reached
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
+    #[test]
+    fn rejects_unexported_workspace_subpaths() {
+        let root = tempdir().unwrap();
+        let shared_dir = root.path().join("shared");
+        fs::create_dir_all(&shared_dir).unwrap();
+        let index = shared_dir.join("index.ts");
+        let secret = shared_dir.join("secret.ts");
+        let app = root.path().join("app.ts");
+        fs::write(&index, "export const public = true;").unwrap();
+        fs::write(&secret, "export const secret = true;").unwrap();
+        fs::write(
+            &app,
+            "import { secret } from 'shared/secret'; export default secret;",
+        )
+        .unwrap();
+
+        let packages = vec![Package {
+            name: "shared".to_string(),
+            dir: shared_dir,
+            scripts: BTreeMap::new(),
+            entrypoint: Some(index.clone()),
+            exports: BTreeMap::from([(".".to_string(), index)]),
+            dependencies: BTreeSet::new(),
+        }];
+        let targets = vec![Target {
+            package: "app".to_string(),
+            entrypoint: app.clone(),
+        }];
+        let graph = DependencyGraph::build(&[secret, app], &targets, &packages).unwrap();
+
+        assert!(graph.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "MONORIPPLE_UNRESOLVED_WORKSPACE_IMPORT"
+                && diagnostic.severity == Severity::Error
+        }));
     }
 
     #[test]
