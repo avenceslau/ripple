@@ -13,6 +13,7 @@ monoripple finds JavaScript and TypeScript applications affected by a change at 
 - separate runtime and type dependency graphs
 - base/current graph union for deletions, renames, and removed exports
 - deploy and typecheck affected queries
+- Cargo workspace path-dependency propagation for Rust tasks
 - runtime module and workspace package cycle detection
 - structured diagnostics with warning policies
 - local content-addressed parse cache
@@ -161,6 +162,5 @@ The base and current graphs are combined before traversal so removed declaration
 
 - lockfile changes conservatively affect every target because external dependency changes are not yet linked to exact consumers
 - virtual and generated entrypoints need explicit plugin roots for complete precision
-- Rust source changes affect their owning target, but Cargo dependency graphs are not yet modeled
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
 - deploy queries model source/configuration reachability, not final artifact hashes

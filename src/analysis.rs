@@ -97,35 +97,6 @@ pub fn find_change_seeds(
                 continue;
             }
 
-            let is_root_cargo_input = change.path.parent() == Some(root)
-                && matches!(file_name, "Cargo.toml" | "Cargo.lock");
-            let is_unowned_cargo_input = package_owner.is_some_and(|package| package.dir == root)
-                && (is_rust_source || matches!(file_name, "Cargo.toml" | "build.rs"));
-            if is_root_cargo_input || is_unowned_cargo_input {
-                let details = describe_direct_input(root, base, change)?;
-                for package in packages.iter().filter(|package| {
-                    package.dir.join("Cargo.toml").is_file()
-                        && graph
-                            .targets
-                            .iter()
-                            .any(|target| target.package == package.name)
-                }) {
-                    result
-                        .direct_packages
-                        .entry(package.name.clone())
-                        .or_default()
-                        .insert(change.path.clone(), details.clone());
-                    for (path, module) in graph
-                        .modules
-                        .iter()
-                        .filter(|(path, _)| path.starts_with(&package.dir))
-                    {
-                        add_all_symbols(&mut result.nodes, &mut result.type_nodes, path, module);
-                    }
-                }
-                continue;
-            }
-
             if let Some(package) = package_owner {
                 let relative = change
                     .path
