@@ -202,6 +202,60 @@ pub fn targets_for_packages(packages: &[Package], selected: &BTreeSet<String>) -
         .collect()
 }
 
+pub fn generated_roots_for(
+    packages: &[Package],
+    targets: &[Target],
+    files: &[PathBuf],
+) -> (BTreeMap<String, Vec<PathBuf>>, BTreeSet<String>) {
+    let represented: BTreeSet<_> = files
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect();
+    let mut roots = BTreeMap::new();
+    let mut external = BTreeSet::new();
+
+    for target in targets {
+        let entrypoint = target
+            .entrypoint
+            .canonicalize()
+            .unwrap_or_else(|_| target.entrypoint.clone());
+        if represented.contains(&entrypoint) {
+            continue;
+        }
+        let Some(package) = packages
+            .iter()
+            .find(|package| package.name == target.package)
+        else {
+            continue;
+        };
+        if has_vite_config(&package.dir) {
+            let package_roots: Vec<_> = files
+                .iter()
+                .filter(|path| path.starts_with(&package.dir))
+                .filter(|path| {
+                    let relative = path.strip_prefix(&package.dir).unwrap_or(path);
+                    relative.components().next().is_some_and(|component| {
+                        matches!(
+                            component.as_os_str().to_str(),
+                            Some("src" | "app" | "routes")
+                        )
+                    }) || is_vite_config(relative)
+                })
+                .cloned()
+                .collect();
+            if !package_roots.is_empty() {
+                roots.insert(package.name.clone(), package_roots);
+                continue;
+            }
+        }
+        if package.dir.join("Cargo.toml").is_file() {
+            external.insert(package.name.clone());
+        }
+    }
+
+    (roots, external)
+}
+
 pub fn task_roots_for(
     packages: &[Package],
     selected: &BTreeSet<String>,
@@ -468,6 +522,18 @@ fn is_test_root(path: &Path) -> bool {
         })
 }
 
+fn has_vite_config(dir: &Path) -> bool {
+    ["ts", "mts", "cts", "js", "mjs", "cjs"]
+        .into_iter()
+        .any(|extension| dir.join(format!("vite.config.{extension}")).is_file())
+}
+
+fn is_vite_config(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("vite.config."))
+}
+
 fn root_export(exports: &Value) -> Option<&str> {
     match exports {
         Value::Object(map) if map.contains_key(".") => export_path(&map["."]),
@@ -539,6 +605,64 @@ mod tests {
         let targets = targets_for(&packages, "deploy");
         assert_eq!(targets[0].package, "worker");
         assert!(targets[0].entrypoint.ends_with("apps/worker/src/index.ts"));
+    }
+
+    #[test]
+    fn discovers_vite_and_cargo_generated_targets() {
+        let root = tempdir().unwrap();
+        let web = root.path().join("apps/web");
+        let rust_worker = root.path().join("apps/rust-worker");
+        fs::create_dir_all(web.join("src")).unwrap();
+        fs::create_dir_all(rust_worker.join("build")).unwrap();
+        fs::write(
+            web.join("package.json"),
+            r#"{"name":"web","scripts":{"deploy":"wrangler deploy"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            web.join("wrangler.jsonc"),
+            "{ main: '@framework/server-entry' }",
+        )
+        .unwrap();
+        fs::write(web.join("vite.config.ts"), "export default {};\n").unwrap();
+        fs::write(web.join("src/router.ts"), "export const router = {};\n").unwrap();
+        fs::write(
+            rust_worker.join("package.json"),
+            r#"{"name":"rust-worker","scripts":{"deploy":"wrangler deploy"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            rust_worker.join("wrangler.jsonc"),
+            "{ main: 'build/index.js' }",
+        )
+        .unwrap();
+        fs::write(rust_worker.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let packages = discover_packages(root.path()).unwrap();
+        let files = discover_source_files(root.path(), &packages, false);
+        let targets = targets_for(&packages, "deploy");
+        let (roots, external) = generated_roots_for(&packages, &targets, &files);
+
+        assert!(
+            roots["web"]
+                .iter()
+                .any(|path| path.ends_with("apps/web/src/router.ts"))
+        );
+        assert!(external.contains("rust-worker"));
+
+        let mut graph = crate::graph::DependencyGraph::build(&files, &targets, &packages).unwrap();
+        for (package, roots) in roots {
+            graph.add_target_roots(&package, &roots);
+        }
+        for package in external {
+            graph.add_external_target(&package);
+        }
+        assert!(
+            graph
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "MONORIPPLE_VIRTUAL_OR_GENERATED_ENTRYPOINT")
+        );
     }
 
     #[test]
