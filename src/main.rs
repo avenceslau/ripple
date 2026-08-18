@@ -19,7 +19,9 @@ use monoripple::parser::ImportedName;
 use monoripple::plugin::{PluginEdgeKind, run_configured_plugins};
 use monoripple::ui::{WhyUiItem, WhyUiModel};
 use monoripple::viz::{GraphLink, GraphNode, GraphView, NodeKind, render_html};
-use monoripple::workspace::{discover_packages, discover_source_files, targets_for};
+use monoripple::workspace::{
+    discover_packages, discover_source_files, targets_for, test_roots_for,
+};
 
 #[derive(Parser)]
 #[command(name = "monoripple", version, about)]
@@ -1139,8 +1141,10 @@ fn build_graph(
     cache_report: bool,
 ) -> Result<DependencyGraph> {
     let packages = discover_packages(root)?;
-    let mut files = discover_source_files(root, &packages);
+    let include_tests = target == "test" || target.starts_with("test:");
+    let mut files = discover_source_files(root, &packages, include_tests);
     let targets = targets_for(&packages, target);
+    let test_roots = include_tests.then(|| test_roots_for(&packages, target, &files));
     let plugins = run_configured_plugins(root, target)?;
     let plugin_targets: Vec<_> = plugins
         .targets
@@ -1172,6 +1176,11 @@ fn build_graph(
     let cache_dir = (!no_cache).then(default_cache_dir).flatten();
     let mut graph =
         DependencyGraph::build_with_cache(&files, &targets, &packages, cache_dir.as_deref())?;
+    if let Some(test_roots) = test_roots {
+        for (package, roots) in test_roots {
+            graph.add_target_roots(&package, &roots);
+        }
+    }
     for (package, roots) in plugin_targets {
         graph.add_target_roots(&package, &roots);
     }

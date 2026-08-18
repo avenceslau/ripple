@@ -47,7 +47,10 @@ monoripple run deploy --base origin/main
 monoripple run deploy --base origin/main --runner vite-plus
 monoripple run deploy --base origin/main -- --environment staging
 monoripple run check:type --mode typecheck --base origin/main
+monoripple run test --base origin/main
 ```
+
+Test targets include co-located `*.test.*` and `*.spec.*` files, files under `test`, `tests`, and `__tests__`, and Vitest or Jest configuration files. For Workers projects, test reachability also follows Wrangler service and Durable Object script references to workspace workers whose builds participate in the test environment.
 
 `auto` selects Vite+ when the root package declares `vite-plus` or contains `node_modules/.bin/vp`; otherwise it uses Turbo through the detected package manager. Use `--runner` to override this with `vite-plus`, `pnpm`, `npx`, `bun`, `yarn`, or a direct `turbo` binary. Use `--print` to inspect the command without executing it, and repeat `--runner-arg` for task-runner options:
 

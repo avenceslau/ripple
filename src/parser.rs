@@ -75,15 +75,23 @@ pub fn is_source_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts")
-    ) && !path
-        .file_name()
+    )
+}
+
+pub fn is_test_file(path: &Path) -> bool {
+    let in_test_directory = path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("test" | "tests" | "__tests__")
+        )
+    });
+    if in_test_directory {
+        return true;
+    }
+
+    path.file_stem()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.ends_with(".test.ts")
-                || name.ends_with(".test.tsx")
-                || name.ends_with(".spec.ts")
-                || name.ends_with(".spec.tsx")
-        })
+        .is_some_and(|name| name.ends_with(".test") || name.ends_with(".spec"))
 }
 
 pub fn parse_module(path: &Path, source: &str) -> Result<ParsedModule> {
