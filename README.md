@@ -18,6 +18,7 @@ monoripple finds JavaScript and TypeScript applications affected by a change at 
 - structured diagnostics with warning policies
 - local content-addressed parse cache
 - external target-discovery plugins
+- Vite source roots and Cargo-backed generated Worker targets
 - multiple impact paths with per-edge source explanations
 
 ## Install
@@ -161,6 +162,6 @@ The base and current graphs are combined before traversal so removed declaration
 ## Current boundaries
 
 - lockfile changes conservatively affect every target because external dependency changes are not yet linked to exact consumers
-- virtual and generated entrypoints need explicit plugin roots for complete precision
+- non-Vite virtual entrypoints need explicit plugin roots for complete precision
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
 - deploy queries model source/configuration reachability, not final artifact hashes

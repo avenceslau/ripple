@@ -21,8 +21,8 @@ use monoripple::plugin::{PluginEdgeKind, run_configured_plugins};
 use monoripple::ui::{WhyUiItem, WhyUiModel};
 use monoripple::viz::{GraphLink, GraphNode, GraphView, NodeKind, render_html};
 use monoripple::workspace::{
-    discover_packages, discover_source_files, package_for_path, targets_for_packages,
-    task_packages_for, task_roots_for, test_roots_for,
+    discover_packages, discover_source_files, generated_roots_for, package_for_path,
+    targets_for_packages, task_packages_for, task_roots_for, test_roots_for,
 };
 
 #[derive(Parser)]
@@ -1217,6 +1217,7 @@ fn build_graph(
     let mut files = discover_source_files(root, &packages, include_tests);
     let (selected, task_names) = task_packages_for(root, &packages, target);
     let targets = targets_for_packages(&packages, &selected);
+    let (generated_roots, external_targets) = generated_roots_for(&packages, &targets, &files);
     let include_all_files = matches!(task, TaskKind::Typecheck) || is_package_wide_task(target);
     let task_roots = task_roots_for(&packages, &selected, &task_names, &files, include_all_files);
     let test_roots = include_tests.then(|| test_roots_for(&packages, target, &files));
@@ -1251,6 +1252,12 @@ fn build_graph(
     let cache_dir = (!no_cache).then(default_cache_dir).flatten();
     let mut graph =
         DependencyGraph::build_with_cache(&files, &targets, &packages, cache_dir.as_deref())?;
+    for (package, roots) in generated_roots {
+        graph.add_target_roots(&package, &roots);
+    }
+    for package in external_targets {
+        graph.add_external_target(&package);
+    }
     for (package, roots) in task_roots {
         graph.add_target_roots(&package, &roots);
     }

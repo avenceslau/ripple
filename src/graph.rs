@@ -773,6 +773,21 @@ impl DependencyGraph {
         });
     }
 
+    pub fn add_external_target(&mut self, package: &str) {
+        if !self.targets.iter().any(|target| target.package == package) {
+            self.targets.push(TargetNode {
+                package: package.to_string(),
+                node: Self::target_node(package),
+            });
+        }
+        self.diagnostics.retain(|diagnostic| {
+            diagnostic.code != "MONORIPPLE_VIRTUAL_OR_GENERATED_ENTRYPOINT"
+                || !diagnostic
+                    .message
+                    .starts_with(&format!("target `{package}` "))
+        });
+    }
+
     fn resolve_export(
         &self,
         path: &Path,
