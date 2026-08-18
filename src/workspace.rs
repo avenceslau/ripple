@@ -44,6 +44,18 @@ struct PackageJson {
     optional_dependencies: BTreeMap<String, String>,
 }
 
+#[derive(Default, Deserialize)]
+struct TurboConfig {
+    #[serde(default)]
+    tasks: BTreeMap<String, TurboTask>,
+}
+
+#[derive(Default, Deserialize)]
+struct TurboTask {
+    #[serde(default, rename = "dependsOn")]
+    depends_on: Vec<String>,
+}
+
 pub fn discover_packages(root: &Path) -> Result<Vec<Package>> {
     let mut packages = Vec::new();
     let walker = WalkBuilder::new(root)
@@ -149,15 +161,93 @@ pub fn discover_source_files(
 }
 
 pub fn targets_for(packages: &[Package], script: &str) -> Vec<Target> {
-    packages
+    let selected: BTreeSet<_> = packages
         .iter()
         .filter(|package| script == "all" || package.scripts.contains_key(script))
+        .map(|package| package.name.clone())
+        .collect();
+    targets_for_packages(packages, &selected)
+}
+
+pub fn task_packages_for(
+    root: &Path,
+    packages: &[Package],
+    task: &str,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let task_names = turbo_task_names(root, task);
+    let selected = packages
+        .iter()
+        .filter(|package| package.dir != root)
+        .filter(|package| {
+            task == "all"
+                || task_names
+                    .iter()
+                    .any(|task_name| package.scripts.contains_key(task_name))
+        })
+        .map(|package| package.name.clone())
+        .collect();
+    (selected, task_names)
+}
+
+pub fn targets_for_packages(packages: &[Package], selected: &BTreeSet<String>) -> Vec<Target> {
+    packages
+        .iter()
+        .filter(|package| selected.contains(&package.name))
         .filter_map(|package| {
             package.entrypoint.as_ref().map(|entrypoint| Target {
                 package: package.name.clone(),
                 entrypoint: entrypoint.clone(),
             })
         })
+        .collect()
+}
+
+pub fn task_roots_for(
+    packages: &[Package],
+    selected: &BTreeSet<String>,
+    task_names: &BTreeSet<String>,
+    files: &[PathBuf],
+    include_all_files: bool,
+) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut roots: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
+
+    if include_all_files {
+        roots.extend(
+            selected
+                .iter()
+                .map(|package| (package.clone(), BTreeSet::new())),
+        );
+        for file in files {
+            let Some(package) = package_for_path(packages, file) else {
+                continue;
+            };
+            if selected.contains(&package.name) {
+                roots
+                    .entry(package.name.clone())
+                    .or_default()
+                    .insert(file.clone());
+            }
+        }
+    } else {
+        for package in packages
+            .iter()
+            .filter(|package| selected.contains(&package.name))
+        {
+            for command in task_names
+                .iter()
+                .filter_map(|task_name| package.scripts.get(task_name))
+            {
+                roots
+                    .entry(package.name.clone())
+                    .or_default()
+                    .extend(script_source_paths(package, command));
+            }
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|(package, roots)| (package, roots.into_iter().collect()))
         .collect()
 }
 
@@ -222,6 +312,46 @@ pub fn test_roots_for(
     roots
         .into_iter()
         .map(|(package, roots)| (package, roots.into_iter().collect()))
+        .collect()
+}
+
+fn turbo_task_names(root: &Path, task: &str) -> BTreeSet<String> {
+    let config = fs::read_to_string(root.join("turbo.json"))
+        .ok()
+        .and_then(|source| serde_json::from_str::<TurboConfig>(&source).ok())
+        .unwrap_or_default();
+    let mut result = BTreeSet::new();
+    let mut pending = vec![task.to_string()];
+
+    while let Some(current) = pending.pop() {
+        if !result.insert(current.clone()) {
+            continue;
+        }
+        let Some(configured) = config.tasks.get(&current) else {
+            continue;
+        };
+        for dependency in &configured.depends_on {
+            let dependency = dependency.trim_start_matches('^');
+            if !dependency.starts_with('$') && !dependency.contains('#') {
+                pending.push(dependency.to_string());
+            }
+        }
+    }
+
+    result
+}
+
+fn script_source_paths(package: &Package, command: &str) -> BTreeSet<PathBuf> {
+    command
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(character, '\'' | '"' | '`' | '(' | ')' | ',' | ';')
+            });
+            let token = token.rsplit_once('=').map_or(token, |(_, value)| value);
+            let path = package.dir.join(token.trim_start_matches("./"));
+            (is_source_file(&path) && path.is_file()).then_some(path)
+        })
         .collect()
 }
 
@@ -409,6 +539,59 @@ mod tests {
         let targets = targets_for(&packages, "deploy");
         assert_eq!(targets[0].package, "worker");
         assert!(targets[0].entrypoint.ends_with("apps/worker/src/index.ts"));
+    }
+
+    #[test]
+    fn discovers_turbo_dependencies_and_script_roots() {
+        let root = tempdir().unwrap();
+        let worker = root.path().join("apps/worker");
+        let generator = root.path().join("packages/generator");
+        fs::create_dir_all(worker.join("src")).unwrap();
+        fs::create_dir_all(generator.join("src")).unwrap();
+        fs::write(
+            root.path().join("turbo.json"),
+            r#"{"tasks":{"check":{"dependsOn":["check:type"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            worker.join("package.json"),
+            r#"{"name":"worker","scripts":{"check:type":"tsc"}}"#,
+        )
+        .unwrap();
+        fs::write(worker.join("src/extra.ts"), "export const extra = 1;").unwrap();
+        fs::write(
+            generator.join("package.json"),
+            r#"{"name":"generator","scripts":{"generate":"bun run src/generate.ts"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            generator.join("src/generate.ts"),
+            "export const generate = 1;",
+        )
+        .unwrap();
+
+        let packages = discover_packages(root.path()).unwrap();
+        let files = discover_source_files(root.path(), &packages, false);
+        let (selected, task_names) = task_packages_for(root.path(), &packages, "check");
+        assert_eq!(selected, BTreeSet::from(["worker".to_string()]));
+        assert_eq!(
+            task_names,
+            BTreeSet::from(["check".to_string(), "check:type".to_string()])
+        );
+        let roots = task_roots_for(&packages, &selected, &task_names, &files, true);
+        assert!(
+            roots["worker"]
+                .iter()
+                .any(|path| path.ends_with("apps/worker/src/extra.ts"))
+        );
+
+        let (selected, task_names) = task_packages_for(root.path(), &packages, "generate");
+        let roots = task_roots_for(&packages, &selected, &task_names, &files, false);
+        assert!(
+            roots["generator"]
+                .iter()
+                .any(|path| path.ends_with("packages/generator/src/generate.ts"))
+        );
     }
 
     #[test]
