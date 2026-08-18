@@ -163,12 +163,13 @@ pub fn targets_for(packages: &[Package], script: &str) -> Vec<Target> {
 
 pub fn test_roots_for(
     packages: &[Package],
-    targets: &[Target],
+    script: &str,
     files: &[PathBuf],
 ) -> BTreeMap<String, Vec<PathBuf>> {
-    let selected: BTreeSet<_> = targets
+    let selected: BTreeSet<_> = packages
         .iter()
-        .map(|target| target.package.as_str())
+        .filter(|package| package.scripts.contains_key(script))
+        .map(|package| package.name.as_str())
         .collect();
     let mut roots: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
 
@@ -198,23 +199,22 @@ pub fn test_roots_for(
         }
     }
 
-    for target in targets {
-        let Some(package) = packages
-            .iter()
-            .find(|package| package.name == target.package)
-        else {
-            continue;
-        };
+    for package in packages
+        .iter()
+        .filter(|package| selected.contains(package.name.as_str()))
+    {
         let Some(config) = wrangler_config(&package.dir) else {
             continue;
         };
-        let target_roots = roots.entry(target.package.clone()).or_default();
         for reference in worker_references(&config) {
             let Some((dependency, entrypoint)) = workers.get(&reference) else {
                 continue;
             };
-            if *dependency != target.package {
-                target_roots.insert((*entrypoint).clone());
+            if *dependency != package.name {
+                roots
+                    .entry(package.name.clone())
+                    .or_default()
+                    .insert((*entrypoint).clone());
             }
         }
     }
@@ -416,9 +416,11 @@ mod tests {
         let root = tempdir().unwrap();
         let engine = root.path().join("apps/engine");
         let config = root.path().join("apps/config-service");
+        let tools = root.path().join("packages/tools");
         fs::create_dir_all(engine.join("src")).unwrap();
         fs::create_dir_all(config.join("src")).unwrap();
         fs::create_dir_all(config.join("tests")).unwrap();
+        fs::create_dir_all(tools.join("src")).unwrap();
         fs::write(
             engine.join("package.json"),
             r#"{"name":"engine","module":"src/index.ts"}"#,
@@ -451,6 +453,16 @@ mod tests {
             "export default { test: {} };",
         )
         .unwrap();
+        fs::write(
+            tools.join("package.json"),
+            r#"{"name":"tools","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            tools.join("src/tool.test.ts"),
+            "export const verifies = true;",
+        )
+        .unwrap();
 
         let packages = discover_packages(root.path()).unwrap();
         let production_files = discover_source_files(root.path(), &packages, false);
@@ -462,7 +474,7 @@ mod tests {
 
         let files = discover_source_files(root.path(), &packages, true);
         let targets = targets_for(&packages, "test");
-        let test_roots = test_roots_for(&packages, &targets, &files);
+        let test_roots = test_roots_for(&packages, "test", &files);
         let roots = &test_roots["config-service"];
         assert!(
             roots
@@ -474,6 +486,11 @@ mod tests {
             roots
                 .iter()
                 .any(|path| path.ends_with("apps/engine/src/index.ts"))
+        );
+        assert!(
+            test_roots["tools"]
+                .iter()
+                .any(|path| path.ends_with("packages/tools/src/tool.test.ts"))
         );
 
         let mut graph = crate::graph::DependencyGraph::build(&files, &targets, &packages).unwrap();
@@ -491,6 +508,17 @@ mod tests {
                 .contains(&crate::graph::DependencyGraph::target_node(
                     "config-service"
                 ))
+        );
+
+        let changed = BTreeSet::from([crate::graph::Node::new(
+            crate::graph::normalize_path(tools.join("src/tool.test.ts")),
+            "verifies",
+        )]);
+        let reachability = graph.affected(&changed);
+        assert!(
+            reachability
+                .reached
+                .contains(&crate::graph::DependencyGraph::target_node("tools"))
         );
     }
 }

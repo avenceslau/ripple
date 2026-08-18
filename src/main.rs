@@ -1144,7 +1144,7 @@ fn build_graph(
     let include_tests = target == "test" || target.starts_with("test:");
     let mut files = discover_source_files(root, &packages, include_tests);
     let targets = targets_for(&packages, target);
-    let test_roots = include_tests.then(|| test_roots_for(&packages, &targets, &files));
+    let test_roots = include_tests.then(|| test_roots_for(&packages, target, &files));
     let plugins = run_configured_plugins(root, target)?;
     let plugin_targets: Vec<_> = plugins
         .targets
