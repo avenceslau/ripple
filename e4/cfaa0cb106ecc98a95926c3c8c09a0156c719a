@@ -1,0 +1,19 @@
+src/workspace.rs
+  s_041310b7a54893::t_95ae99dc9ea23e 166,169,171-172,202-205,213-217,419,423,456-465,477,490-494,512-522
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4cfaa0cb106ecc98a95926c3c8c09a0156c719a",
+  "prompts": {},
+  "sessions": {
+    "s_041310b7a54893": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fb7b7-9bc1-7b2d-8ab1-1fea35c69bd0",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
