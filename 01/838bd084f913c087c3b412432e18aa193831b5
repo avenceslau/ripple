@@ -1,0 +1,19 @@
+src/main.rs
+  s_ef52dbd8406602::t_90447f8aa97ba4 15,1152,1173-1192
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "01838bd084f913c087c3b412432e18aa193831b5",
+  "prompts": {},
+  "sessions": {
+    "s_ef52dbd8406602": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a001bd-c360-7bf6-b9b4-95b4ede3016e",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
