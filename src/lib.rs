@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod cache;
+pub mod cargo;
 pub mod diagnostics;
 pub mod git;
 pub mod graph;

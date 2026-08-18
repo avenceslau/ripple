@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use monoripple::analysis::{ChangeSeeds, find_change_seeds};
 use monoripple::cache::default_cache_dir;
+use monoripple::cargo::affected_packages as affected_cargo_packages;
 use monoripple::diagnostics::{Diagnostic, Severity};
 use monoripple::git::{changed_files, extract_revision, repository_root};
 use monoripple::graph::{DependencyGraph, EdgeExplanation, Node};
@@ -1148,8 +1149,8 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         &graph,
         base_graph.as_ref(),
     )?;
+    let (selected, task_names) = task_packages_for(root, &packages, &query.target);
     if matches!(query.task, TaskKind::Typecheck) || is_package_wide_task(&query.target) {
-        let (selected, _) = task_packages_for(root, &packages, &query.target);
         for change in &changes {
             let Some(owner) = package_for_path(&packages, &change.path) else {
                 continue;
@@ -1167,6 +1168,26 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
                     vec!["changed package task input".to_string()],
                 );
             }
+        }
+    }
+    if task_names.iter().any(|task| task.contains("rust")) {
+        let changed_paths: Vec<_> = changes.iter().map(|change| change.path.clone()).collect();
+        let cargo_input = changed_paths
+            .iter()
+            .find(|path| {
+                path.extension().is_some_and(|extension| extension == "rs")
+                    || matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("Cargo.toml" | "Cargo.lock" | "build.rs")
+                    )
+            })
+            .cloned()
+            .unwrap_or_else(|| root.join("Cargo.toml"));
+        for package in affected_cargo_packages(root, &changed_paths, &packages, &selected)? {
+            seeds.direct_packages.entry(package).or_default().insert(
+                cargo_input.clone(),
+                vec!["affected through Cargo workspace dependencies".to_string()],
+            );
         }
     }
     let reachability = match query.task {
