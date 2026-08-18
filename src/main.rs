@@ -20,7 +20,8 @@ use monoripple::plugin::{PluginEdgeKind, run_configured_plugins};
 use monoripple::ui::{WhyUiItem, WhyUiModel};
 use monoripple::viz::{GraphLink, GraphNode, GraphView, NodeKind, render_html};
 use monoripple::workspace::{
-    discover_packages, discover_source_files, targets_for, test_roots_for,
+    discover_packages, discover_source_files, package_for_path, targets_for_packages,
+    task_packages_for, task_roots_for, test_roots_for,
 };
 
 #[derive(Parser)]
@@ -58,8 +59,8 @@ struct RunArgs {
     #[arg(long)]
     target: Option<String>,
 
-    #[arg(long, value_enum, default_value = "deploy")]
-    mode: TaskKind,
+    #[arg(long, value_enum)]
+    mode: Option<TaskKind>,
 
     #[arg(long, value_enum, default_value = "auto")]
     runner: TaskRunner,
@@ -214,10 +215,17 @@ fn run_task(root: &Path, args: &RunArgs) -> Result<()> {
         .target
         .clone()
         .unwrap_or_else(|| args.task_name.clone());
+    let task = args.mode.unwrap_or_else(|| {
+        if args.task_name == "check:type" {
+            TaskKind::Typecheck
+        } else {
+            TaskKind::Deploy
+        }
+    });
     let query = QueryArgs {
         base: args.base.clone(),
         target,
-        task: args.mode,
+        task,
         format: OutputFormat::Text,
         no_cache: args.no_cache,
         cache_report: args.cache_report,
@@ -984,7 +992,12 @@ fn run_why(root: &Path, package: &str, ui: bool, query: &QueryArgs) -> Result<()
 }
 
 fn run_check(root: &Path, args: &CheckArgs) -> Result<()> {
-    let graph = build_graph(root, &args.target, args.no_cache, args.cache_report)?;
+    let task = if args.target == "check:type" {
+        TaskKind::Typecheck
+    } else {
+        TaskKind::Deploy
+    };
+    let graph = build_graph(root, &args.target, task, args.no_cache, args.cache_report)?;
 
     if matches!(args.format, OutputFormat::Json) {
         println!("{}", serde_json::to_string_pretty(&graph.diagnostics)?);
@@ -1059,9 +1072,19 @@ struct Analysis {
     base: String,
 }
 
+fn is_package_wide_task(target: &str) -> bool {
+    target == "check" || target.contains("lint") || target.contains("format")
+}
+
 fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     let packages = discover_packages(root)?;
-    let mut graph = build_graph(root, &query.target, query.no_cache, query.cache_report)?;
+    let mut graph = build_graph(
+        root,
+        &query.target,
+        query.task,
+        query.no_cache,
+        query.cache_report,
+    )?;
     let changes = changed_files(root, &query.base)?;
     let needs_base_graph = changes.iter().any(|change| {
         monoripple::parser::is_source_file(&change.path)
@@ -1078,7 +1101,13 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         .then(|| extract_revision(root, &query.base))
         .transpose()?;
     let base_graph = if let Some(snapshot) = &base_snapshot {
-        let mut base_graph = build_graph(snapshot.path(), &query.target, query.no_cache, false)?;
+        let mut base_graph = build_graph(
+            snapshot.path(),
+            &query.target,
+            query.task,
+            query.no_cache,
+            false,
+        )?;
         base_graph.remap_root(snapshot.path(), root);
         graph.merge_edges_from(&base_graph);
         Some(base_graph)
@@ -1111,7 +1140,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     }
     graph.diagnostics.sort();
     graph.diagnostics.dedup();
-    let seeds = find_change_seeds(
+    let mut seeds = find_change_seeds(
         root,
         &query.base,
         &changes,
@@ -1119,6 +1148,27 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         &graph,
         base_graph.as_ref(),
     )?;
+    if matches!(query.task, TaskKind::Typecheck) || is_package_wide_task(&query.target) {
+        let (selected, _) = task_packages_for(root, &packages, &query.target);
+        for change in &changes {
+            let Some(owner) = package_for_path(&packages, &change.path) else {
+                continue;
+            };
+            let affected: Vec<_> = if owner.dir == root {
+                selected.iter().cloned().collect()
+            } else if selected.contains(&owner.name) {
+                vec![owner.name.clone()]
+            } else {
+                Vec::new()
+            };
+            for package in affected {
+                seeds.direct_packages.entry(package).or_default().insert(
+                    change.path.clone(),
+                    vec!["changed package task input".to_string()],
+                );
+            }
+        }
+    }
     let reachability = match query.task {
         TaskKind::Deploy => graph.affected(&seeds.nodes),
         TaskKind::Typecheck => graph.affected_typecheck(&seeds.type_nodes),
@@ -1137,13 +1187,17 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
 fn build_graph(
     root: &Path,
     target: &str,
+    task: TaskKind,
     no_cache: bool,
     cache_report: bool,
 ) -> Result<DependencyGraph> {
     let packages = discover_packages(root)?;
     let include_tests = target == "test" || target.starts_with("test:");
     let mut files = discover_source_files(root, &packages, include_tests);
-    let targets = targets_for(&packages, target);
+    let (selected, task_names) = task_packages_for(root, &packages, target);
+    let targets = targets_for_packages(&packages, &selected);
+    let include_all_files = matches!(task, TaskKind::Typecheck) || is_package_wide_task(target);
+    let task_roots = task_roots_for(&packages, &selected, &task_names, &files, include_all_files);
     let test_roots = include_tests.then(|| test_roots_for(&packages, target, &files));
     let plugins = run_configured_plugins(root, target)?;
     let plugin_targets: Vec<_> = plugins
@@ -1176,6 +1230,9 @@ fn build_graph(
     let cache_dir = (!no_cache).then(default_cache_dir).flatten();
     let mut graph =
         DependencyGraph::build_with_cache(&files, &targets, &packages, cache_dir.as_deref())?;
+    for (package, roots) in task_roots {
+        graph.add_target_roots(&package, &roots);
+    }
     if let Some(test_roots) = test_roots {
         for (package, roots) in test_roots {
             graph.add_target_roots(&package, &roots);
@@ -1235,34 +1292,19 @@ fn build_graph(
 }
 
 fn affected_packages(analysis: &Analysis) -> Vec<String> {
-    let mut affected = BTreeSet::new();
-
-    match analysis.task {
-        TaskKind::Deploy => {
-            for target in &analysis.graph.targets {
-                if analysis.reachability.reached.contains(&target.node)
-                    || analysis.seeds.direct_packages.contains_key(&target.package)
-                {
-                    affected.insert(target.package.clone());
-                }
-            }
-        }
-        TaskKind::Typecheck => {
-            for node in &analysis.reachability.reached {
-                if let Some(package) = analysis
-                    .packages
-                    .iter()
-                    .filter(|package| node.file.starts_with(&package.dir))
-                    .max_by_key(|package| package.dir.components().count())
-                {
-                    affected.insert(package.name.clone());
-                }
-            }
-            affected.extend(analysis.seeds.direct_packages.keys().cloned());
-        }
-    }
-
-    affected.into_iter().collect()
+    let mut affected: Vec<_> = analysis
+        .graph
+        .targets
+        .iter()
+        .filter(|target| {
+            analysis.reachability.reached.contains(&target.node)
+                || analysis.seeds.direct_packages.contains_key(&target.package)
+        })
+        .map(|target| target.package.clone())
+        .collect();
+    affected.sort();
+    affected.dedup();
+    affected
 }
 
 fn display_edge_location(root: &Path, explanation: &EdgeExplanation) -> Option<String> {
