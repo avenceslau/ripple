@@ -161,7 +161,8 @@ The base and current graphs are combined before traversal so removed declaration
 
 ## Current boundaries
 
-- lockfile changes conservatively affect every target because external dependency changes are not yet linked to exact consumers
+- pnpm v9 lockfile changes are modeled per workspace importer, including each importer’s resolved external dependency closure; changed library importers propagate through the existing runtime/type graph
+- unsupported or malformed pnpm lockfiles, root/global settings, overrides, patches, ambiguous resolutions, and other lockfile formats conservatively affect every target and emit `MONORIPPLE_LOCKFILE_CHANGE_UNMODELED`
 - non-Vite virtual entrypoints need explicit plugin roots for complete precision
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
 - deploy queries model source/configuration reachability, not final artifact hashes
