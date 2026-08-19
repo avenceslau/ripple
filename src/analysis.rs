@@ -84,6 +84,7 @@ pub fn find_change_seeds(
                                 seed_package_input(
                                     &mut result,
                                     graph,
+                                    packages,
                                     package,
                                     &change.path,
                                     vec!["changed pnpm dependency resolution".to_string()],
@@ -150,7 +151,14 @@ pub fn find_change_seeds(
 
                 if is_rust_source || is_build_input {
                     let details = describe_direct_input(root, base, change)?;
-                    seed_package_input(&mut result, graph, package, &change.path, details);
+                    seed_package_input(
+                        &mut result,
+                        graph,
+                        packages,
+                        package,
+                        &change.path,
+                        details,
+                    );
                 }
             }
             continue;
@@ -584,6 +592,7 @@ fn pnpm_resolution_key(
 fn seed_package_input(
     result: &mut ChangeSeeds,
     graph: &DependencyGraph,
+    packages: &[Package],
     package: &Package,
     path: &Path,
     details: Vec<String>,
@@ -593,11 +602,9 @@ fn seed_package_input(
         .entry(package.name.clone())
         .or_default()
         .insert(path.to_path_buf(), details);
-    for (path, module) in graph
-        .modules
-        .iter()
-        .filter(|(path, _)| path.starts_with(&package.dir))
-    {
+    for (path, module) in graph.modules.iter().filter(|(path, _)| {
+        package_for_path(packages, path).is_some_and(|owner| owner.dir == package.dir)
+    }) {
         add_all_symbols(&mut result.nodes, &mut result.type_nodes, path, module);
     }
 }
@@ -935,6 +942,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn package_input_seeding_excludes_nested_workspaces() {
+        let root = tempdir().unwrap();
+        let app_source = root.path().join("apps/app/index.ts");
+        fs::create_dir_all(app_source.parent().unwrap()).unwrap();
+        fs::write(&app_source, "export const value = true;").unwrap();
+
+        let root_package = test_package(root.path(), "root", "");
+        let mut app = test_package(root.path(), "app", "apps/app");
+        app.entrypoint = Some(app_source.clone());
+        let packages = [root_package.clone(), app.clone()];
+        let target = Target {
+            package: app.name.clone(),
+            entrypoint: app_source.clone(),
+        };
+        let graph = DependencyGraph::build(&[app_source], &[target], &packages).unwrap();
+        let mut seeds = ChangeSeeds::default();
+
+        seed_package_input(
+            &mut seeds,
+            &graph,
+            &packages,
+            &root_package,
+            &root.path().join("package.json"),
+            vec!["changed package manifest".to_string()],
+        );
+
+        assert!(seeds.nodes.is_empty());
+        assert!(seeds.type_nodes.is_empty());
+        assert!(
+            !graph
+                .affected(&seeds.nodes)
+                .reached
+                .contains(&DependencyGraph::target_node("app"))
+        );
+    }
+
     fn modeled_packages(impact: PnpmLockfileImpact) -> BTreeSet<String> {
         match impact {
             PnpmLockfileImpact::Modeled(packages) => packages,
@@ -1030,6 +1074,7 @@ snapshots:
             seed_package_input(
                 &mut seeds,
                 &graph,
+                std::slice::from_ref(&app),
                 &app,
                 &root.path().join("pnpm-lock.yaml"),
                 vec!["changed pnpm dependency resolution".to_string()],
@@ -1088,6 +1133,7 @@ snapshots:
         seed_package_input(
             &mut seeds,
             &graph,
+            &packages,
             &shared,
             &root.path().join("pnpm-lock.yaml"),
             vec!["changed pnpm dependency resolution".to_string()],
