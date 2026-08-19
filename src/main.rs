@@ -1117,30 +1117,17 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     };
 
     for change in &changes {
-        let file_name = change.path.file_name().and_then(|name| name.to_str());
-        if matches!(
-            file_name,
-            Some(
-                "pnpm-lock.yaml"
-                    | "package-lock.json"
-                    | "yarn.lock"
-                    | "bun.lock"
-                    | "bun.lockb"
-                    | "Cargo.lock"
-            )
-        ) {
+        if change.path.file_name().and_then(|name| name.to_str()) == Some("Cargo.lock") {
             graph.diagnostics.push(Diagnostic {
                 code: "MONORIPPLE_LOCKFILE_CHANGE_UNMODELED",
                 severity: Severity::Warning,
-                message: "lockfile changes conservatively affect targets because exact runtime consumers are not modeled"
+                message: "Cargo lockfile changes conservatively affect Rust task targets because exact runtime consumers are not modeled"
                     .to_string(),
                 path: Some(change.path.clone()),
                 members: Vec::new(),
             });
         }
     }
-    graph.diagnostics.sort();
-    graph.diagnostics.dedup();
     let mut seeds = find_change_seeds(
         root,
         &query.base,
@@ -1149,6 +1136,9 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         &graph,
         base_graph.as_ref(),
     )?;
+    graph.diagnostics.append(&mut seeds.diagnostics);
+    graph.diagnostics.sort();
+    graph.diagnostics.dedup();
     let (selected, task_names) = task_packages_for(root, &packages, &query.target);
     if matches!(query.task, TaskKind::Typecheck) || is_package_wide_task(&query.target) {
         for change in &changes {
