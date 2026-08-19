@@ -161,8 +161,9 @@ The base and current graphs are combined before traversal so removed declaration
 
 ## Current boundaries
 
+- lockfile handling is package-manager agnostic: each package manager is a specialization keyed by its lockfile name, with pnpm modeled precisely and npm, yarn, and bun routed through a shared conservative fallback
 - pnpm v9 lockfile changes are modeled per workspace importer, including each importer’s resolved external dependency closure; changed library importers propagate through the existing runtime/type graph
-- unsupported or malformed pnpm lockfiles, root/global settings, overrides, patches, ambiguous resolutions, and other lockfile formats conservatively affect every target and emit `MONORIPPLE_LOCKFILE_CHANGE_UNMODELED`
+- unsupported or malformed pnpm lockfiles, root/global settings, overrides, patches, ambiguous resolutions, and package managers without a precise specialization conservatively affect every target and emit `MONORIPPLE_LOCKFILE_CHANGE_UNMODELED`
 - non-Vite virtual entrypoints need explicit plugin roots for complete precision
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
 - deploy queries model source/configuration reachability, not final artifact hashes
