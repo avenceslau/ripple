@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use oxc_allocator::Allocator;
@@ -14,7 +15,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 
 use crate::parser::{MODULE_INIT, parse_module};
-use crate::tsgo::TsgoClient;
+use crate::tsgo::{DEFAULT_TIMEOUT, TsgoClient};
 
 #[derive(Clone, Debug)]
 pub struct TypeScriptFact {
@@ -57,6 +58,15 @@ pub fn analyze(
     compiler_root: &Path,
     files: &[PathBuf],
 ) -> Result<Option<TypeScriptFacts>> {
+    analyze_with_timeout(source_root, compiler_root, files, DEFAULT_TIMEOUT)
+}
+
+pub fn analyze_with_timeout(
+    source_root: &Path,
+    compiler_root: &Path,
+    files: &[PathBuf],
+    timeout: Duration,
+) -> Result<Option<TypeScriptFacts>> {
     let tsgo = find_tsgo();
     if tsgo.is_none() && !TsgoClient::has_embedded_tsgo() {
         return Ok(None);
@@ -86,7 +96,7 @@ pub fn analyze(
         return Ok(None);
     }
 
-    let mut client = TsgoClient::new(tsgo.as_deref())
+    let mut client = TsgoClient::with_timeout(tsgo.as_deref(), timeout)
         .map_err(|error| anyhow::anyhow!("failed to start tsgo: {error}"))?;
     client
         .initialize(&file_uri(source_root)?)

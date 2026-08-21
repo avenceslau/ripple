@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,7 +20,7 @@ use monoripple::git::{changed_files, extract_revision, repository_root};
 use monoripple::graph::{DependencyGraph, EdgeExplanation, Node};
 use monoripple::parser::ImportedName;
 use monoripple::plugin::{PluginEdgeKind, run_configured_plugins};
-use monoripple::typescript::analyze as analyze_with_tsgo;
+use monoripple::typescript::analyze_with_timeout as analyze_with_tsgo;
 use monoripple::ui::{WhyUiItem, WhyUiModel};
 use monoripple::viz::{GraphLink, GraphNode, GraphView, NodeKind, render_html};
 use monoripple::workspace::{
@@ -31,6 +33,9 @@ use monoripple::workspace::{
 struct Cli {
     #[arg(long, global = true, default_value = ".")]
     root: PathBuf,
+
+    #[arg(long, global = true, default_value = "5000")]
+    tsgo_timeout_ms: NonZeroU64,
 
     #[command(subcommand)]
     command: Command,
@@ -196,6 +201,7 @@ struct AffectedOutput {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tsgo_timeout = Duration::from_millis(cli.tsgo_timeout_ms.get());
     let start = if cli.root.is_absolute() {
         cli.root
     } else {
@@ -204,15 +210,15 @@ fn main() -> Result<()> {
     let root = repository_root(&start)?;
 
     match cli.command {
-        Command::Affected(query) => run_affected(&root, &query),
-        Command::Check(args) => run_check(&root, &args),
-        Command::Why { package, ui, query } => run_why(&root, &package, ui, &query),
-        Command::Graph(args) => run_graph(&root, &args),
-        Command::Run(args) => run_task(&root, &args),
+        Command::Affected(query) => run_affected(&root, &query, tsgo_timeout),
+        Command::Check(args) => run_check(&root, &args, tsgo_timeout),
+        Command::Why { package, ui, query } => run_why(&root, &package, ui, &query, tsgo_timeout),
+        Command::Graph(args) => run_graph(&root, &args, tsgo_timeout),
+        Command::Run(args) => run_task(&root, &args, tsgo_timeout),
     }
 }
 
-fn run_task(root: &Path, args: &RunArgs) -> Result<()> {
+fn run_task(root: &Path, args: &RunArgs, tsgo_timeout: Duration) -> Result<()> {
     let target = args
         .target
         .clone()
@@ -233,7 +239,7 @@ fn run_task(root: &Path, args: &RunArgs) -> Result<()> {
         cache_report: args.cache_report,
         warnings: args.warnings,
     };
-    let analysis = analyze(root, &query)?;
+    let analysis = analyze(root, &query, tsgo_timeout)?;
     emit_diagnostics(
         root,
         &analysis.graph.diagnostics,
@@ -336,8 +342,8 @@ fn shell_argument(argument: &str) -> String {
     }
 }
 
-fn run_graph(root: &Path, args: &GraphArgs) -> Result<()> {
-    let analysis = analyze(root, &args.query)?;
+fn run_graph(root: &Path, args: &GraphArgs, tsgo_timeout: Duration) -> Result<()> {
+    let analysis = analyze(root, &args.query, tsgo_timeout)?;
     let view = build_graph_view(root, &analysis, args.scope);
     let html = render_html(&view);
 
@@ -740,8 +746,8 @@ fn open_in_browser(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_affected(root: &Path, query: &QueryArgs) -> Result<()> {
-    let analysis = analyze(root, query)?;
+fn run_affected(root: &Path, query: &QueryArgs, tsgo_timeout: Duration) -> Result<()> {
+    let analysis = analyze(root, query, tsgo_timeout)?;
     emit_diagnostics(
         root,
         &analysis.graph.diagnostics,
@@ -790,11 +796,17 @@ fn run_affected(root: &Path, query: &QueryArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_why(root: &Path, package: &str, ui: bool, query: &QueryArgs) -> Result<()> {
+fn run_why(
+    root: &Path,
+    package: &str,
+    ui: bool,
+    query: &QueryArgs,
+    tsgo_timeout: Duration,
+) -> Result<()> {
     if matches!(query.task, TaskKind::Typecheck) {
         bail!("`why` for typecheck queries is not implemented yet");
     }
-    let analysis = analyze(root, query)?;
+    let analysis = analyze(root, query, tsgo_timeout)?;
     emit_diagnostics(
         root,
         &analysis.graph.diagnostics,
@@ -993,7 +1005,7 @@ fn run_why(root: &Path, package: &str, ui: bool, query: &QueryArgs) -> Result<()
     Ok(())
 }
 
-fn run_check(root: &Path, args: &CheckArgs) -> Result<()> {
+fn run_check(root: &Path, args: &CheckArgs, tsgo_timeout: Duration) -> Result<()> {
     let task = if args.target == "check:type" {
         TaskKind::Typecheck
     } else {
@@ -1006,6 +1018,7 @@ fn run_check(root: &Path, args: &CheckArgs) -> Result<()> {
         task,
         args.no_cache,
         args.cache_report,
+        tsgo_timeout,
     )?;
 
     if matches!(args.format, OutputFormat::Json) {
@@ -1085,7 +1098,7 @@ fn is_package_wide_task(target: &str) -> bool {
     target == "check" || target.contains("lint") || target.contains("format")
 }
 
-fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
+fn analyze(root: &Path, query: &QueryArgs, tsgo_timeout: Duration) -> Result<Analysis> {
     let packages = discover_packages(root)?;
     let mut graph = build_graph(
         root,
@@ -1094,6 +1107,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
         query.task,
         query.no_cache,
         query.cache_report,
+        tsgo_timeout,
     )?;
     let changes = changed_files(root, &query.base)?;
     let needs_base_graph = changes.iter().any(|change| {
@@ -1118,6 +1132,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
             query.task,
             query.no_cache,
             false,
+            tsgo_timeout,
         )?;
         base_graph.remap_root(snapshot.path(), root);
         graph.merge_edges_from(&base_graph);
@@ -1212,6 +1227,7 @@ fn build_graph(
     task: TaskKind,
     no_cache: bool,
     cache_report: bool,
+    tsgo_timeout: Duration,
 ) -> Result<DependencyGraph> {
     let packages = discover_packages(root)?;
     let include_tests = target == "test" || target.starts_with("test:");
@@ -1253,7 +1269,7 @@ fn build_graph(
     let cache_dir = (!no_cache).then(default_cache_dir).flatten();
     let mut graph =
         DependencyGraph::build_with_cache(&files, &targets, &packages, cache_dir.as_deref())?;
-    match analyze_with_tsgo(root, compiler_root, &files) {
+    match analyze_with_tsgo(root, compiler_root, &files, tsgo_timeout) {
         Ok(Some(facts)) => graph.apply_typescript_facts(&facts),
         Ok(None) => {}
         Err(error) => graph.diagnostics.push(Diagnostic {
@@ -1367,4 +1383,31 @@ fn display_node(root: &Path, node: &Node) -> String {
 
     let path = node.file.strip_prefix(root).unwrap_or(&node.file);
     format!("{}#{}", path.display(), node.symbol)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_tsgo_timeout_to_five_seconds() {
+        let cli = Cli::try_parse_from(["monoripple", "affected"]).unwrap();
+
+        assert_eq!(cli.tsgo_timeout_ms.get(), 5_000);
+    }
+
+    #[test]
+    fn parses_tsgo_timeout_after_subcommand() {
+        let cli =
+            Cli::try_parse_from(["monoripple", "affected", "--tsgo-timeout-ms", "30000"]).unwrap();
+
+        assert_eq!(cli.tsgo_timeout_ms.get(), 30_000);
+    }
+
+    #[test]
+    fn rejects_zero_tsgo_timeout() {
+        let result = Cli::try_parse_from(["monoripple", "affected", "--tsgo-timeout-ms", "0"]);
+
+        assert!(result.is_err());
+    }
 }

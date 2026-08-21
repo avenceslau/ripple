@@ -34,6 +34,7 @@ cargo install monoripple
 monoripple --root /path/to/monorepo affected --base origin/main
 monoripple --root /path/to/monorepo affected --base origin/main --format json
 monoripple --root /path/to/monorepo affected --base origin/main --task typecheck
+monoripple --root /path/to/monorepo affected --base origin/main --tsgo-timeout-ms 30000
 monoripple --root /path/to/monorepo why @acme/app --base origin/main
 monoripple --root /path/to/monorepo why @acme/app --base origin/main --ui
 monoripple --root /path/to/monorepo check
@@ -98,7 +99,7 @@ monoripple check --warnings error
 
 The local cache defaults to `$XDG_CACHE_HOME/monoripple` or `~/.cache/monoripple`. Disable it with `--no-cache`, inspect it with `--cache-report`, or override it with `MONORIPPLE_CACHE_DIR`.
 
-For typed registry precision, monoripple queries `tsgo --lsp --stdio` using the same hover-based approach as Tenet. Release builds include a pinned, compressed tsgo binary and TypeScript standard libraries, extracted once under the monoripple cache directory. `MONORIPPLE_TSGO`, `tsgo` on `PATH`, and Bun's `@typescript/native-preview` cache override the embedded binary. If tsgo is unavailable, times out, or cannot prove a call target, the runtime graph remains conservative.
+For typed registry precision, monoripple queries `tsgo --lsp --stdio` using the same hover-based approach as Tenet. Release builds include a pinned, compressed tsgo binary and TypeScript standard libraries, extracted once under the monoripple cache directory. `MONORIPPLE_TSGO`, `tsgo` on `PATH`, and Bun's `@typescript/native-preview` cache override the embedded binary. LSP requests time out after 5,000 milliseconds by default; use `--tsgo-timeout-ms` to override the timeout. If tsgo is unavailable, times out, or cannot prove a call target, the runtime graph remains conservative.
 
 ## Plugins
 
