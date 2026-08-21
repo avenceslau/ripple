@@ -1,0 +1,8 @@
+diff --git a/internal/ls/hover.go b/internal/ls/hover.go
+index 867013c58..69910faab 100644
+--- a/internal/ls/hover.go
++++ b/internal/ls/hover.go
+@@ -25,2 +25,2 @@ const (
+-	typeFormatFlags   = checker.TypeFormatFlagsUseAliasDefinedOutsideCurrentScope | checker.TypeFormatFlagsUseInstantiationExpressions
++	typeFormatFlags   = checker.TypeFormatFlagsUseAliasDefinedOutsideCurrentScope | checker.TypeFormatFlagsUseInstantiationExpressions | checker.TypeFormatFlagsNoTruncation
+ )

@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 use crate::diagnostics::{Diagnostic, Severity, cycles};
 use crate::parser::{
     ImportBinding, ImportedName, MODULE_INIT, ParsedModule, SourceLocation, parse_module,
+    registry_entry_symbol,
 };
+use crate::typescript::TypeScriptFacts;
 use crate::workspace::{Package, Target};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
@@ -43,6 +45,7 @@ pub struct DependencyGraph {
     pub targets: Vec<TargetNode>,
     pub diagnostics: Vec<Diagnostic>,
     pub cache_stats: CacheStats,
+    typed_registry_edges: BTreeMap<(Node, Node), SourceLocation>,
     resolver: Resolver,
     workspace_packages: Vec<WorkspacePackage>,
 }
@@ -97,14 +100,14 @@ impl DependencyGraph {
                 .with_context(|| format!("failed to read {}", path.display()))?;
             let parsed = if let Some(cache_dir) = cache_dir {
                 let mut hasher = Sha256::new();
-                hasher.update(b"monoripple-parse-v5\0");
+                hasher.update(b"monoripple-parse-v7\0");
                 hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
                 hasher.update(b"\0oxc-0.120.0\0");
                 hasher.update(path.extension().unwrap_or_default().as_encoded_bytes());
                 hasher.update(b"\0");
                 hasher.update(source.as_bytes());
                 let key = format!("{:x}", hasher.finalize());
-                let cache_path = cache_dir.join("parse-v5").join(format!("{key}.json"));
+                let cache_path = cache_dir.join("parse-v7").join(format!("{key}.json"));
 
                 match fs::read(&cache_path)
                     .ok()
@@ -199,6 +202,7 @@ impl DependencyGraph {
             targets: Vec::new(),
             diagnostics: Vec::new(),
             cache_stats,
+            typed_registry_edges: BTreeMap::new(),
             resolver,
             workspace_packages,
         };
@@ -361,6 +365,62 @@ impl DependencyGraph {
         }
 
         if let Some(module) = self.modules.get(&consumer.file) {
+            if !type_only
+                && let Some(location) = self
+                    .typed_registry_edges
+                    .get(&(consumer.clone(), dependency.clone()))
+            {
+                return EdgeExplanation {
+                    detail: format!(
+                        "`{}` passes a TypeScript-proven registry key",
+                        consumer.symbol
+                    ),
+                    path: Some(consumer.file.clone()),
+                    location: Some(*location),
+                };
+            }
+
+            if !type_only && let Some(symbol) = module.symbols.get(&consumer.symbol) {
+                for (registry, keys) in &symbol.keyed_dependencies {
+                    for key in keys {
+                        let dependencies = self.resolve_keyed_dependency(
+                            &consumer.file,
+                            registry,
+                            &BTreeSet::from([key.clone()]),
+                        );
+                        if dependencies.is_some_and(|nodes| nodes.contains(dependency)) {
+                            let source = module
+                                .imports
+                                .get(registry)
+                                .map_or_else(String::new, |import| {
+                                    format!(" from `{}`", import.source)
+                                });
+                            return EdgeExplanation {
+                                detail: format!(
+                                    "`{}` reads registry key `{key}`{source}",
+                                    consumer.symbol
+                                ),
+                                path: Some(consumer.file.clone()),
+                                location: symbol.dependency_locations.get(registry).copied(),
+                            };
+                        }
+                    }
+                }
+            }
+
+            if !type_only
+                && let Some(registry) = module.registries.get(&consumer.symbol)
+                && let Some((key, entry)) = registry.entries.iter().find(|(key, _)| {
+                    dependency.symbol == registry_entry_symbol(&consumer.symbol, key)
+                })
+            {
+                return EdgeExplanation {
+                    detail: format!("registry `{}` contains key `{key}`", consumer.symbol),
+                    path: Some(consumer.file.clone()),
+                    location: Some(entry.location),
+                };
+            }
+
             let import = if type_only {
                 module.type_imports.get(&consumer.symbol)
             } else {
@@ -462,6 +522,18 @@ impl DependencyGraph {
             .collect();
         self.edges = remap_edges(std::mem::take(&mut self.edges), &from, &to);
         self.type_edges = remap_edges(std::mem::take(&mut self.type_edges), &from, &to);
+        self.typed_registry_edges = std::mem::take(&mut self.typed_registry_edges)
+            .into_iter()
+            .map(|((consumer, dependency), location)| {
+                (
+                    (
+                        Node::new(remap_path(&consumer.file, &from, &to), consumer.symbol),
+                        Node::new(remap_path(&dependency.file, &from, &to), dependency.symbol),
+                    ),
+                    location,
+                )
+            })
+            .collect();
         for diagnostic in &mut self.diagnostics {
             diagnostic.path = diagnostic
                 .path
@@ -494,6 +566,90 @@ impl DependencyGraph {
         }
     }
 
+    pub fn apply_typescript_facts(&mut self, facts: &TypeScriptFacts) {
+        let typescript_indexed: BTreeSet<_> = facts
+            .indexed_registries
+            .iter()
+            .map(|registry| Node::new(normalize_path(&registry.file), &registry.symbol))
+            .collect();
+        let mut indexed = BTreeSet::new();
+        let mut transparent_edges = Vec::new();
+        for (path, module) in &self.modules {
+            for dependency in &module.indexed_registry_dependencies {
+                let Some(registries) = self.resolve_registry_nodes(path, dependency) else {
+                    continue;
+                };
+                let registries: BTreeSet<_> = registries
+                    .into_iter()
+                    .filter(|node| {
+                        typescript_indexed.contains(node)
+                            && self
+                                .modules
+                                .get(&node.file)
+                                .is_some_and(|module| module.registries.contains_key(&node.symbol))
+                    })
+                    .collect();
+                if registries.is_empty() {
+                    continue;
+                }
+                indexed.extend(registries);
+                transparent_edges.push((Node::new(path, MODULE_INIT), Node::new(path, dependency)));
+            }
+        }
+        for (consumer, dependency) in transparent_edges {
+            if let Some(dependencies) = self.edges.get_mut(&consumer) {
+                dependencies.remove(&dependency);
+            }
+        }
+
+        for fact in &facts.facts {
+            let registry = Node::new(normalize_path(&fact.registry_file), &fact.registry_symbol);
+            if !indexed.contains(&registry) {
+                continue;
+            }
+            let file = normalize_path(&fact.file);
+            let Some(module) = self.modules.get(&file) else {
+                continue;
+            };
+            let consumer_symbol = if module.symbols.contains_key(&fact.consumer) {
+                fact.consumer.as_str()
+            } else {
+                MODULE_INIT
+            };
+            let consumer = Node::new(&file, consumer_symbol);
+            let mut dependencies = BTreeSet::new();
+            if let Some(keys) = &fact.keys {
+                for key in keys {
+                    let has_entry = self
+                        .modules
+                        .get(&registry.file)
+                        .and_then(|module| module.registries.get(&registry.symbol))
+                        .is_some_and(|registry| registry.entries.contains_key(key));
+                    if !has_entry {
+                        dependencies.clear();
+                        break;
+                    }
+                    dependencies.insert(Node::new(
+                        &registry.file,
+                        registry_entry_symbol(&registry.symbol, key),
+                    ));
+                }
+            }
+            if dependencies.is_empty() {
+                dependencies.insert(registry.clone());
+            }
+            let location = SourceLocation {
+                line: fact.line,
+                column: fact.column,
+            };
+            for dependency in dependencies {
+                self.typed_registry_edges
+                    .insert((consumer.clone(), dependency.clone()), location);
+                self.add_edge(consumer.clone(), dependency);
+            }
+        }
+    }
+
     pub fn merge_edges_from(&mut self, other: &Self) {
         for (consumer, dependencies) in &other.edges {
             self.edges
@@ -507,6 +663,8 @@ impl DependencyGraph {
                 .or_default()
                 .extend(dependencies.iter().cloned());
         }
+        self.typed_registry_edges
+            .extend(other.typed_registry_edges.clone());
     }
 
     fn link_modules(&mut self) {
@@ -520,10 +678,31 @@ impl DependencyGraph {
             for (name, symbol) in &module.symbols {
                 let consumer = Node::new(&path, name);
                 for dependency in &symbol.dependencies {
-                    self.add_edge(consumer.clone(), Node::new(&path, dependency));
+                    let keyed = symbol
+                        .keyed_dependencies
+                        .get(dependency)
+                        .and_then(|keys| self.resolve_keyed_dependency(&path, dependency, keys));
+                    if let Some(keyed) = keyed {
+                        for dependency in keyed {
+                            self.add_edge(consumer.clone(), dependency);
+                        }
+                    } else {
+                        self.add_edge(consumer.clone(), Node::new(&path, dependency));
+                    }
                 }
                 for dependency in &symbol.type_dependencies {
                     self.add_type_edge(consumer.clone(), Node::new(&path, dependency));
+                }
+            }
+
+            for (name, registry) in &module.registries {
+                let registry_node = Node::new(&path, name);
+                for (key, entry) in &registry.entries {
+                    let entry_node = Node::new(&path, registry_entry_symbol(name, key));
+                    self.add_edge(registry_node.clone(), entry_node.clone());
+                    if let Some(dependency) = &entry.dependency {
+                        self.add_edge(entry_node, Node::new(&path, dependency));
+                    }
                 }
             }
 
@@ -610,6 +789,56 @@ impl DependencyGraph {
                 }
             }
         }
+    }
+
+    fn resolve_keyed_dependency(
+        &self,
+        path: &Path,
+        dependency: &str,
+        keys: &BTreeSet<String>,
+    ) -> Option<BTreeSet<Node>> {
+        if keys.is_empty() {
+            return None;
+        }
+        let registries = self.resolve_registry_nodes(path, dependency)?;
+        if registries.is_empty() {
+            return None;
+        }
+
+        let mut entries = BTreeSet::new();
+        for registry_node in registries {
+            let registry = self
+                .modules
+                .get(&registry_node.file)?
+                .registries
+                .get(&registry_node.symbol)?;
+            for key in keys {
+                if !registry.entries.contains_key(key) {
+                    return None;
+                }
+                entries.insert(Node::new(
+                    &registry_node.file,
+                    registry_entry_symbol(&registry_node.symbol, key),
+                ));
+            }
+        }
+        Some(entries)
+    }
+
+    fn resolve_registry_nodes(&self, path: &Path, dependency: &str) -> Option<BTreeSet<Node>> {
+        let module = self.modules.get(path)?;
+        if module.registries.contains_key(dependency) {
+            return Some(BTreeSet::from([Node::new(path, dependency)]));
+        }
+
+        let import = module.imports.get(dependency)?;
+        let ImportedName::Named(imported) = &import.imported else {
+            return None;
+        };
+        let dependency_path = self.resolve(path, &import.source)?;
+        let mut visited = BTreeSet::new();
+        let registries = self.resolve_export(&dependency_path, imported, &mut visited);
+        (!registries.is_empty()).then_some(registries)
     }
 
     fn link_import(&mut self, path: &Path, local_name: &str, import: &ImportBinding) {
@@ -1210,6 +1439,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::typescript::{TypeScriptFact, TypeScriptFacts, TypeScriptRegistry};
 
     #[test]
     fn reuses_local_parse_cache() {
@@ -1282,6 +1512,106 @@ mod tests {
             !reached
                 .reached
                 .contains(&DependencyGraph::target_node("app-b"))
+        );
+    }
+
+    #[test]
+    fn typescript_facts_narrow_indexed_array_registry_calls() {
+        let root = tempdir().unwrap();
+        let manifest = root.path().join("manifest.ts");
+        let runtime = root.path().join("runtime.ts");
+        let alpha = root.path().join("alpha.ts");
+        let added = root.path().join("added.ts");
+        fs::write(
+            &manifest,
+            "const alpha = { name: 'alpha' } as const; const added = { name: 'added' } as const; export const registry = [alpha, added] as const;",
+        )
+        .unwrap();
+        fs::write(
+            &runtime,
+            "import { registry } from './manifest'; const index = new Map(); export function lookup(key: string) { return index.get(key); } for (const entry of registry) { index.set(entry.name, entry); }",
+        )
+        .unwrap();
+        fs::write(
+            &alpha,
+            "import { lookup } from './runtime'; const result = lookup('alpha'); export default result;",
+        )
+        .unwrap();
+        fs::write(
+            &added,
+            "import { lookup } from './runtime'; const result = lookup('added'); export default result;",
+        )
+        .unwrap();
+        let targets = [
+            Target {
+                package: "alpha".to_string(),
+                entrypoint: alpha.clone(),
+            },
+            Target {
+                package: "added".to_string(),
+                entrypoint: added.clone(),
+            },
+        ];
+        let mut graph = DependencyGraph::build(
+            &[manifest.clone(), runtime, alpha.clone(), added.clone()],
+            &targets,
+            &[],
+        )
+        .unwrap();
+        let registry = Node::new(normalize_path(&manifest), "registry");
+        let added_entry = Node::new(
+            normalize_path(&manifest),
+            registry_entry_symbol("registry", "added"),
+        );
+        let broad = graph.affected(&BTreeSet::from([added_entry.clone()]));
+        assert!(
+            broad
+                .reached
+                .contains(&DependencyGraph::target_node("alpha"))
+        );
+
+        graph.apply_typescript_facts(&TypeScriptFacts {
+            indexed_registries: vec![TypeScriptRegistry {
+                file: manifest.clone(),
+                symbol: "registry".to_string(),
+            }],
+            facts: vec![
+                TypeScriptFact {
+                    file: alpha,
+                    consumer: "result".to_string(),
+                    registry_file: manifest.clone(),
+                    registry_symbol: "registry".to_string(),
+                    keys: Some(vec!["alpha".to_string()]),
+                    line: 1,
+                    column: 60,
+                },
+                TypeScriptFact {
+                    file: added,
+                    consumer: "result".to_string(),
+                    registry_file: manifest,
+                    registry_symbol: "registry".to_string(),
+                    keys: Some(vec!["added".to_string()]),
+                    line: 1,
+                    column: 60,
+                },
+            ],
+        });
+        let narrowed = graph.affected(&BTreeSet::from([added_entry]));
+        assert!(
+            narrowed
+                .reached
+                .contains(&DependencyGraph::target_node("added"))
+        );
+        assert!(
+            !narrowed
+                .reached
+                .contains(&DependencyGraph::target_node("alpha"))
+        );
+        assert!(
+            graph
+                .edges
+                .values()
+                .any(|dependencies| dependencies.contains(&registry))
         );
     }
 

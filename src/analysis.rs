@@ -9,7 +9,9 @@ use crate::diagnostics::{Diagnostic, Severity};
 use crate::git::{ChangeKind, ChangedFile, file_at};
 use crate::graph::{DependencyGraph, Node, normalize_path};
 use crate::package_manager::{LockfileImpact, package_manager_for};
-use crate::parser::{ParsedModule, is_source_file, is_test_file, parse_module};
+use crate::parser::{
+    ParsedModule, is_source_file, is_test_file, parse_module, registry_entry_symbol,
+};
 use crate::workspace::{Package, package_for_path};
 
 #[derive(Clone, Debug, Default)]
@@ -60,9 +62,7 @@ pub fn find_change_seeds(
                 .extension()
                 .is_some_and(|extension| extension == "rs");
             let is_root_lockfile = change.path.parent() == Some(root);
-            if is_root_lockfile
-                && let Some(manager) = package_manager_for(file_name)
-            {
+            if is_root_lockfile && let Some(manager) = package_manager_for(file_name) {
                 match manager.lockfile_impact(root, base, change, packages)? {
                     LockfileImpact::Modeled(package_names) => {
                         for package_name in package_names {
@@ -421,15 +421,18 @@ fn add_changed_symbols(
     current: &ParsedModule,
 ) {
     for (name, current_symbol) in &current.symbols {
-        let changed = old
-            .symbols
-            .get(name)
+        let old_symbol = old.symbols.get(name);
+        let registries = old.registries.get(name).zip(current.registries.get(name));
+        let runtime_changed = old_symbol
             .is_none_or(|old_symbol| old_symbol.fingerprint != current_symbol.fingerprint);
-        if changed {
+        let type_changed = registries.map_or(runtime_changed, |(old, current)| {
+            old.full_fingerprint != current.full_fingerprint
+        });
+        if type_changed {
             type_seeds.insert(Node::new(current_path, name));
-            if current_symbol.runtime {
-                runtime_seeds.insert(Node::new(current_path, name));
-            }
+        }
+        if runtime_changed && current_symbol.runtime {
+            runtime_seeds.insert(Node::new(current_path, name));
         }
     }
 
@@ -441,6 +444,65 @@ fn add_changed_symbols(
             }
         }
     }
+
+    let registry_names: BTreeSet<_> = old
+        .registries
+        .keys()
+        .chain(current.registries.keys())
+        .cloned()
+        .collect();
+    for name in registry_names {
+        match (old.registries.get(&name), current.registries.get(&name)) {
+            (Some(old_registry), Some(current_registry)) => {
+                let old_common_order: Vec<_> = old_registry
+                    .entry_order
+                    .iter()
+                    .filter(|key| current_registry.entries.contains_key(*key))
+                    .collect();
+                let current_common_order: Vec<_> = current_registry
+                    .entry_order
+                    .iter()
+                    .filter(|key| old_registry.entries.contains_key(*key))
+                    .collect();
+                if old_common_order != current_common_order {
+                    runtime_seeds.insert(Node::new(current_path, &name));
+                }
+
+                for (key, entry) in &current_registry.entries {
+                    let changed = old_registry
+                        .entries
+                        .get(key)
+                        .is_none_or(|old_entry| old_entry.fingerprint != entry.fingerprint);
+                    if changed {
+                        runtime_seeds
+                            .insert(Node::new(current_path, registry_entry_symbol(&name, key)));
+                    }
+                }
+                for key in old_registry.entries.keys() {
+                    if !current_registry.entries.contains_key(key) {
+                        runtime_seeds
+                            .insert(Node::new(old_path, registry_entry_symbol(&name, key)));
+                    }
+                }
+            }
+            (None, Some(registry)) => {
+                add_registry_entries(runtime_seeds, current_path, &name, registry.entries.keys());
+            }
+            (Some(registry), None) => {
+                add_registry_entries(runtime_seeds, old_path, &name, registry.entries.keys());
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+fn add_registry_entries<'a>(
+    seeds: &mut BTreeSet<Node>,
+    path: &Path,
+    registry: &str,
+    keys: impl Iterator<Item = &'a String>,
+) {
+    seeds.extend(keys.map(|key| Node::new(path, registry_entry_symbol(registry, key))));
 }
 
 fn add_all_symbols(
@@ -454,6 +516,9 @@ fn add_all_symbols(
         if symbol.runtime {
             runtime_seeds.insert(Node::new(path, name));
         }
+    }
+    for (name, registry) in &module.registries {
+        add_registry_entries(runtime_seeds, path, name, registry.entries.keys());
     }
 }
 
@@ -493,6 +558,199 @@ mod tests {
 
         assert!(seeds.contains(&Node::new("shared.ts", "used")));
         assert!(!seeds.contains(&Node::new("shared.ts", "untouched")));
+    }
+
+    fn registry_impact(
+        old_registry: &str,
+        current_registry: &str,
+        consumers: &[(&str, &str)],
+    ) -> BTreeSet<String> {
+        let root = tempdir().unwrap();
+        let registry = root.path().join("registry.ts");
+        fs::write(&registry, current_registry).unwrap();
+        let registry = normalize_path(registry);
+
+        let mut files = vec![registry.clone()];
+        let mut targets = Vec::new();
+        for (name, source) in consumers {
+            let path = root.path().join(format!("{name}.ts"));
+            fs::write(&path, source).unwrap();
+            files.push(path.clone());
+            targets.push(Target {
+                package: (*name).to_string(),
+                entrypoint: path,
+            });
+        }
+        let graph = DependencyGraph::build(&files, &targets, &[]).unwrap();
+        let old = parse_module(&registry, old_registry).unwrap();
+        let current = parse_module(&registry, current_registry).unwrap();
+        let mut seeds = BTreeSet::new();
+        let mut type_seeds = BTreeSet::new();
+        add_changed_symbols(
+            &mut seeds,
+            &mut type_seeds,
+            &registry,
+            &registry,
+            &old,
+            &current,
+        );
+        let reached = graph.affected(&seeds).reached;
+
+        targets
+            .iter()
+            .filter(|target| reached.contains(&DependencyGraph::target_node(&target.package)))
+            .map(|target| target.package.clone())
+            .collect()
+    }
+
+    #[test]
+    fn additive_registry_entry_only_reaches_its_literal_consumer() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, added: 3 };",
+            &[
+                (
+                    "alpha",
+                    "import { registry } from './registry'; const result = registry.alpha; export default result;",
+                ),
+                (
+                    "beta",
+                    "import { registry } from './registry'; const result = registry['beta']; export default result;",
+                ),
+                (
+                    "added",
+                    "import { registry } from './registry'; const result = registry.added; export default result;",
+                ),
+            ],
+        );
+
+        assert_eq!(affected, BTreeSet::from(["added".to_string()]));
+    }
+
+    #[test]
+    fn dynamic_registry_access_remains_broad() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, added: 3 };",
+            &[(
+                "dynamic",
+                "import { registry } from './registry'; const key = process.env.KEY!; const result = registry[key]; export default result;",
+            )],
+        );
+
+        assert_eq!(affected, BTreeSet::from(["dynamic".to_string()]));
+    }
+
+    #[test]
+    fn registry_enumeration_remains_broad() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, added: 3 };",
+            &[(
+                "enumerates",
+                "import { registry } from './registry'; const result = Object.keys(registry); export default result;",
+            )],
+        );
+
+        assert_eq!(affected, BTreeSet::from(["enumerates".to_string()]));
+    }
+
+    #[test]
+    fn registry_reordering_affects_enumeration_but_not_literal_access() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { beta: 2, alpha: 1 };",
+            &[
+                (
+                    "alpha",
+                    "import { registry } from './registry'; const result = registry.alpha; export default result;",
+                ),
+                (
+                    "enumerates",
+                    "import { registry } from './registry'; const result = Object.keys(registry); export default result;",
+                ),
+            ],
+        );
+
+        assert_eq!(affected, BTreeSet::from(["enumerates".to_string()]));
+    }
+
+    #[test]
+    fn registry_mutation_and_escape_remain_broad() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, added: 3 };",
+            &[
+                (
+                    "mutates",
+                    "import { registry } from './registry'; registry.alpha = 4; export default registry.alpha;",
+                ),
+                (
+                    "escapes",
+                    "import { registry } from './registry'; const escaped = registry; export default escaped;",
+                ),
+            ],
+        );
+
+        assert_eq!(
+            affected,
+            BTreeSet::from(["escapes".to_string(), "mutates".to_string()])
+        );
+    }
+
+    #[test]
+    fn non_literal_forwarding_remains_broad() {
+        let affected = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, added: 3 };",
+            &[(
+                "wrapper",
+                "import { registry } from './registry'; function read(key: string) { return registry[key]; } const result = read('added'); export default result;",
+            )],
+        );
+
+        assert_eq!(affected, BTreeSet::from(["wrapper".to_string()]));
+    }
+
+    #[test]
+    fn effectful_or_computed_registry_entries_fall_back_to_the_whole_registry() {
+        let effectful = registry_impact(
+            "declare function create(): number; export const registry = { alpha: 1, beta: 2 };",
+            "declare function create(): number; export const registry = { alpha: 1, beta: 2, added: create() };",
+            &[(
+                "alpha",
+                "import { registry } from './registry'; const result = registry.alpha; export default result;",
+            )],
+        );
+        let computed = registry_impact(
+            "const added = 'added'; export const registry = { alpha: 1, beta: 2 };",
+            "const added = 'added'; export const registry = { alpha: 1, beta: 2, [added]: 3 };",
+            &[(
+                "alpha",
+                "import { registry } from './registry'; const result = registry.alpha; export default result;",
+            )],
+        );
+        let duplicate = registry_impact(
+            "export const registry = { alpha: 1, beta: 2 };",
+            "export const registry = { alpha: 1, beta: 2, alpha: 3 };",
+            &[(
+                "beta",
+                "import { registry } from './registry'; const result = registry.beta; export default result;",
+            )],
+        );
+        let function_valued = registry_impact(
+            "export const registry = { alpha: () => 1 };",
+            "export const registry = { alpha: () => 1, added: () => registry.alpha() };",
+            &[(
+                "alpha",
+                "import { registry } from './registry'; const result = registry.alpha(); export default result;",
+            )],
+        );
+
+        assert_eq!(effectful, BTreeSet::from(["alpha".to_string()]));
+        assert_eq!(computed, BTreeSet::from(["alpha".to_string()]));
+        assert_eq!(duplicate, BTreeSet::from(["beta".to_string()]));
+        assert_eq!(function_valued, BTreeSet::from(["alpha".to_string()]));
     }
 
     #[test]

@@ -8,6 +8,8 @@ pub mod package_manager;
 pub mod parser;
 pub mod plugin;
 pub mod pnpm;
+pub mod tsgo;
+pub mod typescript;
 pub mod ui;
 pub mod viz;
 pub mod workspace;
