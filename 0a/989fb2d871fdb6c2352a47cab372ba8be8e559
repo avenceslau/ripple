@@ -1,0 +1,49 @@
+Cargo.lock
+  s_c2a019c19183e8::t_671de78c0e8fbd 122-133,333-353,377-382,415-420,461-471,728-737,764-772,840,853,860-864,913-918,935,1110,1323-1328,1392-1402,1589-1594,1753,1770-1778,1785-1796,1974-1985,2118-2126,2133,2145-2159,2166-2168,2170-2173,2185-2190,2197-2202,2209-2214,2227-2232,2239-2244,2251-2256,2263-2268,2275-2280,2379-2406
+Cargo.toml
+  s_2432836d1dee7c::t_50e88504a98541 14-17,22,39-44,47-50
+README.md
+  s_2432836d1dee7c::t_d171c438219b95 11,101-102,171-173
+build.rs
+  s_c2a019c19183e8::t_3472c3d6c48626 1-532
+src/parser.rs
+  s_428fe55f8c0572::t_9ccf33a9fdfe9d 6-12,15-19,35,41-54,85-86,100-121,185-352,384,392-434,460-474,480-494,711,717-726,728-742,746-748,818,827-828,843-1036,1120-1245
+src/tsgo/cache.rs
+  s_2432836d1dee7c::t_9f1249c0fe64cb 1-194
+src/tsgo/client.rs
+  s_2432836d1dee7c::t_70076344e7e522 1-1303
+src/tsgo/protocol.rs
+  s_c2a019c19183e8::t_2d1bd1e1a888c6 1-346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0a989fb2d871fdb6c2352a47cab372ba8be8e559",
+  "prompts": {},
+  "sessions": {
+    "s_2432836d1dee7c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a019ae-4a4e-7efc-b172-7fe7db2662e9",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    },
+    "s_428fe55f8c0572": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a01f13-db10-7745-9c1f-e6df553ba8cf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    },
+    "s_c2a019c19183e8": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a01f10-da04-760a-b908-eea6343095a6",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
