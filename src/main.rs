@@ -18,6 +18,7 @@ use monoripple::git::{changed_files, extract_revision, repository_root};
 use monoripple::graph::{DependencyGraph, EdgeExplanation, Node};
 use monoripple::parser::ImportedName;
 use monoripple::plugin::{PluginEdgeKind, run_configured_plugins};
+use monoripple::typescript::analyze as analyze_with_tsgo;
 use monoripple::ui::{WhyUiItem, WhyUiModel};
 use monoripple::viz::{GraphLink, GraphNode, GraphView, NodeKind, render_html};
 use monoripple::workspace::{
@@ -998,7 +999,14 @@ fn run_check(root: &Path, args: &CheckArgs) -> Result<()> {
     } else {
         TaskKind::Deploy
     };
-    let graph = build_graph(root, &args.target, task, args.no_cache, args.cache_report)?;
+    let graph = build_graph(
+        root,
+        root,
+        &args.target,
+        task,
+        args.no_cache,
+        args.cache_report,
+    )?;
 
     if matches!(args.format, OutputFormat::Json) {
         println!("{}", serde_json::to_string_pretty(&graph.diagnostics)?);
@@ -1081,6 +1089,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     let packages = discover_packages(root)?;
     let mut graph = build_graph(
         root,
+        root,
         &query.target,
         query.task,
         query.no_cache,
@@ -1104,6 +1113,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
     let base_graph = if let Some(snapshot) = &base_snapshot {
         let mut base_graph = build_graph(
             snapshot.path(),
+            root,
             &query.target,
             query.task,
             query.no_cache,
@@ -1197,6 +1207,7 @@ fn analyze(root: &Path, query: &QueryArgs) -> Result<Analysis> {
 
 fn build_graph(
     root: &Path,
+    compiler_root: &Path,
     target: &str,
     task: TaskKind,
     no_cache: bool,
@@ -1242,6 +1253,19 @@ fn build_graph(
     let cache_dir = (!no_cache).then(default_cache_dir).flatten();
     let mut graph =
         DependencyGraph::build_with_cache(&files, &targets, &packages, cache_dir.as_deref())?;
+    match analyze_with_tsgo(root, compiler_root, &files) {
+        Ok(Some(facts)) => graph.apply_typescript_facts(&facts),
+        Ok(None) => {}
+        Err(error) => graph.diagnostics.push(Diagnostic {
+            code: "MONORIPPLE_TSGO_ANALYSIS_UNAVAILABLE",
+            severity: Severity::Warning,
+            message: format!(
+                "tsgo registry precision is unavailable; retaining conservative impact: {error}"
+            ),
+            path: None,
+            members: Vec::new(),
+        }),
+    }
     for (package, roots) in generated_roots {
         graph.add_target_roots(&package, &roots);
     }

@@ -8,6 +8,7 @@ monoripple finds JavaScript and TypeScript applications affected by a change at 
 - npm-compatible workspace package manifests and package exports
 - named, default, namespace, and re-exported bindings
 - static namespace-member narrowing
+- per-entry precision for statically keyed object registries and TypeScript-proven named array registries
 - literal dynamic imports and CommonJS `require()`
 - imported non-JavaScript assets
 - separate runtime and type dependency graphs
@@ -97,6 +98,8 @@ monoripple check --warnings error
 
 The local cache defaults to `$XDG_CACHE_HOME/monoripple` or `~/.cache/monoripple`. Disable it with `--no-cache`, inspect it with `--cache-report`, or override it with `MONORIPPLE_CACHE_DIR`.
 
+For typed registry precision, monoripple queries `tsgo --lsp --stdio` using the same hover-based approach as Tenet. Release builds include a pinned, compressed tsgo binary and TypeScript standard libraries, extracted once under the monoripple cache directory. `MONORIPPLE_TSGO`, `tsgo` on `PATH`, and Bun's `@typescript/native-preview` cache override the embedded binary. If tsgo is unavailable, times out, or cannot prove a call target, the runtime graph remains conservative.
+
 ## Plugins
 
 A repository may configure explicit external plugins in `monoripple.json`:
@@ -166,4 +169,7 @@ The base and current graphs are combined before traversal so removed declaration
 - unsupported or malformed pnpm lockfiles, root/global settings, overrides, patches, ambiguous resolutions, and package managers without a precise specialization conservatively affect every target and emit `MONORIPPLE_LOCKFILE_CHANGE_UNMODELED`
 - non-Vite virtual entrypoints need explicit plugin roots for complete precision
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
+- direct registry-entry narrowing supports `registry.foo` and `registry['foo']` reads from top-level `const` object literals with unique static keys and side-effect-free scalar literal values
+- named array registries are narrowed only when entries have unique literal `name` fields, a top-level loop exclusively builds a `Map` with `map.set(entry.name, entry)`, the map is otherwise only read, and tsgo hover resolves the call to a generic registry-key contract
+- missing tsgo, unresolved or `any` call targets, dynamic keys, additional enumeration, mutation, escape, transformed index construction, duplicate/computed keys, and unsupported values retain whole-registry impact
 - deploy queries model source/configuration reachability, not final artifact hashes
