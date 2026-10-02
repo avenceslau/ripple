@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_yaml::Value as YamlValue;
 
 use crate::git::{ChangeKind, ChangedFile, file_at};
@@ -106,7 +107,7 @@ fn pnpm_lockfile_impact(
     current: &str,
     packages: &[Package],
 ) -> LockfileImpact {
-    let old = match serde_yaml::from_str::<PnpmLockfile>(old) {
+    let old = match parse_project_lockfile(old) {
         Ok(lockfile) => lockfile,
         Err(error) => {
             return LockfileImpact::Fallback(format!(
@@ -114,7 +115,7 @@ fn pnpm_lockfile_impact(
             ));
         }
     };
-    let current = match serde_yaml::from_str::<PnpmLockfile>(current) {
+    let current = match parse_project_lockfile(current) {
         Ok(lockfile) => lockfile,
         Err(error) => {
             return LockfileImpact::Fallback(format!(
@@ -189,6 +190,23 @@ fn pnpm_lockfile_impact(
     }
 
     LockfileImpact::Modeled(changed_packages)
+}
+
+/// pnpm may write a leading env lockfile document (config dependencies and the pinned pnpm
+/// version) before the project lockfile. Only the last document holds the project's dependency
+/// resolution, and env changes that alter it are reflected there.
+fn parse_project_lockfile(source: &str) -> std::result::Result<PnpmLockfile, serde_yaml::Error> {
+    let mut documents = serde_yaml::Deserializer::from_str(source);
+    let mut last = documents.next().ok_or_else(|| {
+        <serde_yaml::Error as serde::de::Error>::custom("the lockfile contains no YAML documents")
+    })?;
+    // serde_yaml keeps yielding a failed document forever, so surface each skipped document's
+    // error before advancing.
+    for document in documents {
+        IgnoredAny::deserialize(last)?;
+        last = document;
+    }
+    PnpmLockfile::deserialize(last)
 }
 
 fn is_pnpm_v9(version: &YamlValue) -> bool {
@@ -627,5 +645,108 @@ snapshots: {}
             ambiguous,
             &packages,
         ));
+    }
+
+    const ENV_DOCUMENT: &str = r#"---
+lockfileVersion: '9.0'
+importers:
+  .:
+    configDependencies:
+      '@pnpm/plugin-trusted-deps': {specifier: 0.2.2, version: 0.2.2}
+    packageManagerDependencies:
+      '@pnpm/exe': {specifier: 12.0.0, version: 12.0.0}
+      pnpm: {specifier: 12.0.0, version: 12.0.0}
+packages:
+  '@pnpm/exe@12.0.0': {resolution: {integrity: exe}}
+  '@pnpm/plugin-trusted-deps@0.2.2': {resolution: {integrity: trusted}}
+  pnpm@12.0.0: {resolution: {integrity: pnpm}}
+snapshots:
+  '@pnpm/exe@12.0.0': {}
+  '@pnpm/plugin-trusted-deps@0.2.2': {}
+  pnpm@12.0.0: {}
+"#;
+
+    const PROJECT_DOCUMENT: &str = r#"lockfileVersion: '9.0'
+importers:
+  apps/app:
+    dependencies:
+      external: {specifier: ^1.0.0, version: 1.0.0}
+packages:
+  external@1.0.0: {resolution: {integrity: one}}
+  external@2.0.0: {resolution: {integrity: two}}
+snapshots:
+  external@1.0.0: {}
+  external@2.0.0: {}
+"#;
+
+    fn with_env_document(env_document: &str) -> String {
+        format!("{env_document}---\n{PROJECT_DOCUMENT}")
+    }
+
+    #[test]
+    fn pnpm_env_document_changes_do_not_affect_targets() {
+        let root = tempdir().unwrap();
+        let packages = [test_package(root.path(), "app", "apps/app")];
+        let old = with_env_document(ENV_DOCUMENT);
+        let current = with_env_document(&ENV_DOCUMENT.replace(
+            "      '@pnpm/exe': {specifier: 12.0.0, version: 12.0.0}\n",
+            "",
+        ));
+
+        let changed =
+            modeled_packages(pnpm_lockfile_impact(root.path(), &old, &current, &packages));
+
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn pnpm_project_document_after_env_document_is_modeled() {
+        let root = tempdir().unwrap();
+        let packages = [test_package(root.path(), "app", "apps/app")];
+        let old = with_env_document(ENV_DOCUMENT);
+        let current = old.replace(
+            "external: {specifier: ^1.0.0, version: 1.0.0}",
+            "external: {specifier: ^2.0.0, version: 2.0.0}",
+        );
+
+        let changed =
+            modeled_packages(pnpm_lockfile_impact(root.path(), &old, &current, &packages));
+
+        assert_eq!(changed, BTreeSet::from(["app".to_string()]));
+    }
+
+    #[test]
+    fn malformed_multi_document_pnpm_lockfiles_fall_back() {
+        let root = tempdir().unwrap();
+        let packages = [test_package(root.path(), "app", "apps/app")];
+        let valid = with_env_document(ENV_DOCUMENT);
+
+        for malformed in [
+            format!("{ENV_DOCUMENT}---\nlockfileVersion: ["),
+            format!("---\nlockfileVersion: [\n---\n{PROJECT_DOCUMENT}"),
+        ] {
+            assert_fallback(pnpm_lockfile_impact(
+                root.path(),
+                &valid,
+                &malformed,
+                &packages,
+            ));
+        }
+    }
+
+    #[test]
+    fn pnpm_adding_an_env_document_does_not_affect_targets() {
+        let root = tempdir().unwrap();
+        let packages = [test_package(root.path(), "app", "apps/app")];
+        let current = with_env_document(ENV_DOCUMENT);
+
+        let changed = modeled_packages(pnpm_lockfile_impact(
+            root.path(),
+            PROJECT_DOCUMENT,
+            &current,
+            &packages,
+        ));
+
+        assert!(changed.is_empty());
     }
 }
