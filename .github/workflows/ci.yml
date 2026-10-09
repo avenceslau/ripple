@@ -35,4 +35,33 @@ jobs:
 
       # Stands in for publish-time verification, which the release job skips so
       # third-party build code never runs next to the publishing credentials.
-      - run: cargo package --locked
+      - id: package
+        run: |
+          cargo package --locked
+
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          crate="target/package/monoripple-$version.crate"
+          echo "crate=$crate" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### monoripple $version ($(du -h "$crate" | cut -f1) compressed)"
+            echo
+            echo '```'
+            tar -tzf "$crate"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ steps.package.outputs.crate }}
+          archive: false
+          retention-days: 14
+
+      # Same settings as [package.metadata.docs.rs].
+      - run: cargo doc --locked --no-deps --no-default-features
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: docs
+          path: target/doc
+          retention-days: 14
