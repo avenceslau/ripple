@@ -29,6 +29,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # rust-cache restores build.rs's typescript-go checkout incompletely, which
+      # breaks `git checkout`; start from a fresh clone instead.
+      - run: rm -rf target/tsgo-source
+
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
