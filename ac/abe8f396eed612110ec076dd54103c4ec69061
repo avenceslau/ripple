@@ -1,0 +1,25 @@
+.github/dependabot.yml
+  s_c4cd9c6cfbb5d8::t_294661d2ed64d2 1-6
+.github/workflows/ci.yml
+  s_c4cd9c6cfbb5d8::t_97f544da0ec857 1-38
+.github/workflows/release.yml
+  s_c4cd9c6cfbb5d8::t_8baa13f6e1af0b 1-107
+Cargo.toml
+  s_c4cd9c6cfbb5d8::t_a86efb19fd481e 14-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "acabe8f396eed612110ec076dd54103c4ec69061",
+  "prompts": {},
+  "sessions": {
+    "s_c4cd9c6cfbb5d8": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a120ef-fe92-7425-aa14-a712f4fb784e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
