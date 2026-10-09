@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  plan:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      github-release: ${{ steps.plan.outputs.github-release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+
+          status=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -A "$GITHUB_REPOSITORY release workflow" \
+            "https://crates.io/api/v1/crates/monoripple/$version")
+          case "$status" in
+            200) publish=false ;;
+            404) publish=true ;;
+            *)
+              echo "::error::crates.io returned HTTP $status for monoripple $version"
+              exit 1
+              ;;
+          esac
+
+          github_release=false
+          if ! gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            github_release=true
+          fi
+
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "github-release=$github_release"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true' || needs.plan.outputs.github-release == 'true'
+    runs-on: ubuntu-latest
+    # Required reviewers on this environment are the release gate, and the
+    # crates.io trusted publisher only accepts tokens minted inside it.
+    environment: crates-io
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: needs.plan.outputs.publish == 'true'
+        with:
+          toolchain: stable
+
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        if: needs.plan.outputs.publish == 'true'
+        id: auth
+
+      # --no-verify keeps build.rs (which clones and compiles typescript-go) out of
+      # this job; CI already ran `cargo package` on the same commit.
+      - if: needs.plan.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --no-verify
+
+      - if: needs.plan.outputs.github-release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
