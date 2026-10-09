@@ -11,6 +11,10 @@ categories = ["command-line-utilities", "development-tools"]
 documentation = "https://docs.rs/monoripple"
 repository = "https://github.com/avenceslau/ripple"
 
+# docs.rs builds offline, so the tsgo download in build.rs cannot run there.
+[package.metadata.docs.rs]
+no-default-features = true
+
 [features]
 default = ["bundled-tsgo"]
 bundled-tsgo = ["dep:zstd"]
