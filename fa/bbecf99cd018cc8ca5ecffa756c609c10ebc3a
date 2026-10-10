@@ -1,0 +1,19 @@
+build.rs
+  s_c4cd9c6cfbb5d8::t_2a668589e08920 30-33,50,527-532,535-540
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fabbecf99cd018cc8ca5ecffa756c609c10ebc3a",
+  "prompts": {},
+  "sessions": {
+    "s_c4cd9c6cfbb5d8": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a120ef-fe92-7425-aa14-a712f4fb784e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
