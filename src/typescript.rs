@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     AstKind,
-    ast::{Argument, Expression, IdentifierReference},
+    ast::{Argument, Expression, IdentifierReference, TSMethodSignature, TSType, TSTypeName},
 };
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -201,12 +201,7 @@ fn collect_candidates(
     for node in semantic.nodes().iter() {
         if let AstKind::TSMethodSignature(method) = node.kind()
             && !method.computed
-            && method.type_parameters.as_ref().is_some_and(|params| {
-                params
-                    .params
-                    .iter()
-                    .any(|parameter| parameter.constraint.is_some())
-            })
+            && takes_constrained_key(method)
             && let Some(name) = method.key.static_name()
             && let Some(owner) = enclosing_symbol(&top_level, method.span, false)
         {
@@ -252,6 +247,31 @@ fn collect_candidates(
         });
     }
     Ok(())
+}
+
+// A registry-key contract types its key argument with a constrained type parameter, as in
+// `track<Name extends EventName>(name: Name, ...)`. Generic methods whose first argument is not
+// that key, such as `load<T extends object>(id: string)`, are not registry lookups.
+fn takes_constrained_key(method: &TSMethodSignature<'_>) -> bool {
+    let Some(TSType::TSTypeReference(reference)) = method
+        .params
+        .items
+        .first()
+        .and_then(|parameter| parameter.type_annotation.as_ref())
+        .map(|annotation| &annotation.type_annotation)
+    else {
+        return false;
+    };
+    let TSTypeName::IdentifierReference(key_type) = &reference.type_name else {
+        return false;
+    };
+
+    method.type_parameters.as_ref().is_some_and(|parameters| {
+        parameters
+            .params
+            .iter()
+            .any(|parameter| parameter.constraint.is_some() && parameter.name.name == key_type.name)
+    })
 }
 
 fn identifier_is_object_value(
@@ -362,4 +382,48 @@ fn find_tsgo() -> Option<PathBuf> {
         .collect();
     binaries.sort();
     binaries.pop()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn contract_methods(source: &str) -> Vec<String> {
+        let root = tempdir().unwrap();
+        let path = root.path().join("index.ts");
+        fs::write(&path, source).unwrap();
+        let mut contracts = Vec::new();
+        collect_candidates(&path, source, &mut contracts, &mut Vec::new()).unwrap();
+        contracts
+            .into_iter()
+            .map(|contract| contract.method)
+            .collect()
+    }
+
+    #[test]
+    fn treats_constrained_key_parameters_as_registry_contracts() {
+        let methods = contract_methods(
+            "type EventName = 'opened' | 'closed';
+            export interface Tracker {
+                track<Name extends EventName>(name: Name, payload: object): void;
+            }",
+        );
+
+        assert_eq!(methods, ["track"]);
+    }
+
+    #[test]
+    fn ignores_generic_methods_without_a_constrained_key_parameter() {
+        let methods = contract_methods(
+            "export interface Store {
+                load<T extends object>(id: string, options: object): T;
+                read<T extends string>(): T;
+                find<T extends string>(key: string, fallback: T): T;
+            }",
+        );
+
+        assert!(methods.is_empty());
+    }
 }

@@ -172,6 +172,6 @@ The base and current graphs are combined before traversal so removed declaration
 - non-Vite virtual entrypoints need explicit plugin roots for complete precision
 - non-literal dynamic imports are diagnosed and should be promoted to errors for deployment planning
 - direct registry-entry narrowing supports `registry.foo` and `registry['foo']` reads from top-level `const` object literals with unique static keys and side-effect-free scalar literal values
-- named array registries are narrowed only when entries have unique literal `name` fields, a top-level loop exclusively builds a `Map` with `map.set(entry.name, entry)`, the map is otherwise only read, and tsgo hover resolves the call to a generic registry-key contract
+- named array registries are narrowed only when entries have unique literal `name` fields, a top-level loop exclusively builds a `Map` with `map.set(entry.name, entry)`, the map is otherwise only read, and tsgo hover resolves the call to a generic registry-key contract: an interface method whose first parameter is typed by a constrained type parameter, such as `track<Name extends EventName>(name: Name, ...)`
 - missing tsgo, unresolved or `any` call targets, dynamic keys, additional enumeration, mutation, escape, transformed index construction, duplicate/computed keys, and unsupported values retain whole-registry impact
 - deploy queries model source/configuration reachability, not final artifact hashes
