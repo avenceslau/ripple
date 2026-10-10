@@ -1,0 +1,21 @@
+Cargo.lock
+  s_45692ef0750bae::t_ac4d805dbdd6b4 835
+Cargo.toml
+  s_45692ef0750bae::t_84b18d6e7e322d 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "88bdff65e3c88994677fe3442ee2542b40933f87",
+  "prompts": {},
+  "sessions": {
+    "s_45692ef0750bae": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a125b5-2e25-7188-8ade-256ca16e8adf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
