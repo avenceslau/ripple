@@ -1,0 +1,27 @@
+Cargo.lock
+  s_45692ef0750bae::t_6664c2e4af6509 846
+Cargo.toml
+  s_45692ef0750bae::t_8e8c4d85712147 32
+src/analysis.rs
+  s_45692ef0750bae::t_7107582e32dc12 13,230-241,256-295
+src/graph.rs
+  s_45692ef0750bae::t_c7ca6266099c2c 34-39,109,116,1382-1444
+src/parser.rs
+  s_45692ef0750bae::t_91a815dd7ac9a7 9-12,15-18,20,102-103,816-829,857-858,864-959
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3c76ed138c804edfabaa62e524e025c64916ebf2",
+  "prompts": {},
+  "sessions": {
+    "s_45692ef0750bae": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a125b5-2e25-7188-8ade-256ca16e8adf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
