@@ -1,0 +1,21 @@
+README.md
+  s_45692ef0750bae::t_65f8667d168db9 175
+src/typescript.rs
+  s_45692ef0750bae::t_8cf2274527f1f3 11,204,252-276,386-429
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4f732ac89a0f3e9238d0561af7506e51bbb523d5",
+  "prompts": {},
+  "sessions": {
+    "s_45692ef0750bae": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a125b5-2e25-7188-8ade-256ca16e8adf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "avenceslau <avenceslau@cloudflare.com>"
+    }
+  }
+}
