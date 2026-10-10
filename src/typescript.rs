@@ -71,7 +71,7 @@ pub fn analyze_with_timeout(
     if tsgo.is_none() && !TsgoClient::has_embedded_tsgo() {
         return Ok(None);
     }
-    link_node_modules(source_root, compiler_root);
+    link_node_modules(source_root, compiler_root, files);
     let mut contracts = Vec::new();
     let mut calls = Vec::new();
     let mut registries = BTreeMap::new();
@@ -341,18 +341,82 @@ fn file_uri(path: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))
 }
 
-fn link_node_modules(source_root: &Path, compiler_root: &Path) {
-    if source_root == compiler_root || source_root.join("node_modules").exists() {
+// A base snapshot has no installed dependencies. Workspace packages resolve their dependencies,
+// including sibling workspace packages, through their own `node_modules`, so every one that holds
+// a source file is mirrored. Without them tsgo types workspace imports as `any`, and every
+// unresolved call site falls back to depending on whole registries.
+fn link_node_modules(source_root: &Path, compiler_root: &Path, files: &[PathBuf]) {
+    if source_root == compiler_root {
         return;
     }
-    let modules = compiler_root.join("node_modules");
-    if !modules.exists() {
+    let Ok(compiler_root) = compiler_root.canonicalize() else {
+        return;
+    };
+
+    let directories: BTreeSet<_> = files
+        .iter()
+        .filter_map(|file| file.strip_prefix(source_root).ok())
+        .flat_map(Path::ancestors)
+        .collect();
+    for directory in directories {
+        let compiler_modules = compiler_root.join(directory).join("node_modules");
+        let source_modules = source_root.join(directory).join("node_modules");
+        if compiler_modules.is_dir() && !source_modules.exists() {
+            mirror_node_modules(&compiler_modules, &source_modules, &compiler_root);
+        }
+    }
+}
+
+// pnpm links workspace packages and the virtual store with relative symlinks. Copying those links
+// verbatim makes workspace imports resolve to the snapshot's own sources rather than the current
+// checkout's; everything else links back to the installed copy.
+fn mirror_node_modules(compiler_modules: &Path, source_modules: &Path, compiler_root: &Path) {
+    let Ok(entries) = fs::read_dir(compiler_modules) else {
+        return;
+    };
+    if fs::create_dir_all(source_modules).is_err() {
         return;
     }
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let compiler_entry = entry.path();
+        let source_entry = source_modules.join(entry.file_name());
+        if file_type.is_dir() && entry.file_name().to_string_lossy().starts_with('@') {
+            mirror_node_modules(&compiler_entry, &source_entry, compiler_root);
+            continue;
+        }
+
+        let is_dir = compiler_entry.is_dir();
+        let target = fs::read_link(&compiler_entry)
+            .ok()
+            .filter(|target| {
+                target.is_relative()
+                    && compiler_entry
+                        .canonicalize()
+                        .is_ok_and(|resolved| resolved.starts_with(compiler_root))
+            })
+            .unwrap_or(compiler_entry);
+        symlink(&target, &source_entry, is_dir);
+    }
+}
+
+fn symlink(target: &Path, link: &Path, is_dir: bool) {
     #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(modules, source_root.join("node_modules"));
+    {
+        let _ = is_dir;
+        let _ = std::os::unix::fs::symlink(target, link);
+    }
     #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(modules, source_root.join("node_modules"));
+    {
+        let _ = if is_dir {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+    }
 }
 
 fn find_tsgo() -> Option<PathBuf> {
@@ -425,5 +489,50 @@ mod tests {
         );
 
         assert!(methods.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirrors_workspace_node_modules_into_snapshots() {
+        let compiler = tempdir().unwrap();
+        let snapshot = tempdir().unwrap();
+        let compiler_root = compiler.path();
+        let snapshot_root = snapshot.path();
+
+        let store = compiler_root.join("node_modules/.pnpm/external@1.0.0/node_modules/external");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(compiler_root.join("packages/sibling")).unwrap();
+        let consumer_modules = compiler_root.join("packages/consumer/node_modules");
+        fs::create_dir_all(consumer_modules.join("@acme")).unwrap();
+        std::os::unix::fs::symlink("../../../sibling", consumer_modules.join("@acme/sibling"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules/.pnpm/external@1.0.0/node_modules/external",
+            consumer_modules.join("external"),
+        )
+        .unwrap();
+
+        let source = snapshot_root.join("packages/consumer/src/index.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "").unwrap();
+        fs::create_dir_all(snapshot_root.join("packages/sibling")).unwrap();
+
+        link_node_modules(snapshot_root, compiler_root, &[source]);
+
+        let snapshot_modules = snapshot_root.join("packages/consumer/node_modules");
+        assert_eq!(
+            snapshot_modules
+                .join("@acme/sibling")
+                .canonicalize()
+                .unwrap(),
+            snapshot_root
+                .join("packages/sibling")
+                .canonicalize()
+                .unwrap(),
+        );
+        assert_eq!(
+            snapshot_modules.join("external").canonicalize().unwrap(),
+            store.canonicalize().unwrap(),
+        );
     }
 }
