@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use oxc_allocator::Allocator;
 use oxc_ast::{
     AstKind,
-    ast::{Argument, Expression, IdentifierReference},
+    ast::{Argument, Expression, IdentifierReference, TSMethodSignature, TSType, TSTypeName},
 };
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
@@ -71,7 +71,7 @@ pub fn analyze_with_timeout(
     if tsgo.is_none() && !TsgoClient::has_embedded_tsgo() {
         return Ok(None);
     }
-    link_node_modules(source_root, compiler_root);
+    link_node_modules(source_root, compiler_root, files);
     let mut contracts = Vec::new();
     let mut calls = Vec::new();
     let mut registries = BTreeMap::new();
@@ -201,12 +201,7 @@ fn collect_candidates(
     for node in semantic.nodes().iter() {
         if let AstKind::TSMethodSignature(method) = node.kind()
             && !method.computed
-            && method.type_parameters.as_ref().is_some_and(|params| {
-                params
-                    .params
-                    .iter()
-                    .any(|parameter| parameter.constraint.is_some())
-            })
+            && takes_constrained_key(method)
             && let Some(name) = method.key.static_name()
             && let Some(owner) = enclosing_symbol(&top_level, method.span, false)
         {
@@ -252,6 +247,31 @@ fn collect_candidates(
         });
     }
     Ok(())
+}
+
+// A registry-key contract types its key argument with a constrained type parameter, as in
+// `track<Name extends EventName>(name: Name, ...)`. Generic methods whose first argument is not
+// that key, such as `load<T extends object>(id: string)`, are not registry lookups.
+fn takes_constrained_key(method: &TSMethodSignature<'_>) -> bool {
+    let Some(TSType::TSTypeReference(reference)) = method
+        .params
+        .items
+        .first()
+        .and_then(|parameter| parameter.type_annotation.as_ref())
+        .map(|annotation| &annotation.type_annotation)
+    else {
+        return false;
+    };
+    let TSTypeName::IdentifierReference(key_type) = &reference.type_name else {
+        return false;
+    };
+
+    method.type_parameters.as_ref().is_some_and(|parameters| {
+        parameters
+            .params
+            .iter()
+            .any(|parameter| parameter.constraint.is_some() && parameter.name.name == key_type.name)
+    })
 }
 
 fn identifier_is_object_value(
@@ -321,18 +341,82 @@ fn file_uri(path: &Path) -> Result<String> {
         .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))
 }
 
-fn link_node_modules(source_root: &Path, compiler_root: &Path) {
-    if source_root == compiler_root || source_root.join("node_modules").exists() {
+// A base snapshot has no installed dependencies. Workspace packages resolve their dependencies,
+// including sibling workspace packages, through their own `node_modules`, so every one that holds
+// a source file is mirrored. Without them tsgo types workspace imports as `any`, and every
+// unresolved call site falls back to depending on whole registries.
+fn link_node_modules(source_root: &Path, compiler_root: &Path, files: &[PathBuf]) {
+    if source_root == compiler_root {
         return;
     }
-    let modules = compiler_root.join("node_modules");
-    if !modules.exists() {
+    let Ok(compiler_root) = compiler_root.canonicalize() else {
+        return;
+    };
+
+    let directories: BTreeSet<_> = files
+        .iter()
+        .filter_map(|file| file.strip_prefix(source_root).ok())
+        .flat_map(Path::ancestors)
+        .collect();
+    for directory in directories {
+        let compiler_modules = compiler_root.join(directory).join("node_modules");
+        let source_modules = source_root.join(directory).join("node_modules");
+        if compiler_modules.is_dir() && !source_modules.exists() {
+            mirror_node_modules(&compiler_modules, &source_modules, &compiler_root);
+        }
+    }
+}
+
+// pnpm links workspace packages and the virtual store with relative symlinks. Copying those links
+// verbatim makes workspace imports resolve to the snapshot's own sources rather than the current
+// checkout's; everything else links back to the installed copy.
+fn mirror_node_modules(compiler_modules: &Path, source_modules: &Path, compiler_root: &Path) {
+    let Ok(entries) = fs::read_dir(compiler_modules) else {
+        return;
+    };
+    if fs::create_dir_all(source_modules).is_err() {
         return;
     }
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let compiler_entry = entry.path();
+        let source_entry = source_modules.join(entry.file_name());
+        if file_type.is_dir() && entry.file_name().to_string_lossy().starts_with('@') {
+            mirror_node_modules(&compiler_entry, &source_entry, compiler_root);
+            continue;
+        }
+
+        let is_dir = compiler_entry.is_dir();
+        let target = fs::read_link(&compiler_entry)
+            .ok()
+            .filter(|target| {
+                target.is_relative()
+                    && compiler_entry
+                        .canonicalize()
+                        .is_ok_and(|resolved| resolved.starts_with(compiler_root))
+            })
+            .unwrap_or(compiler_entry);
+        symlink(&target, &source_entry, is_dir);
+    }
+}
+
+fn symlink(target: &Path, link: &Path, is_dir: bool) {
     #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(modules, source_root.join("node_modules"));
+    {
+        let _ = is_dir;
+        let _ = std::os::unix::fs::symlink(target, link);
+    }
     #[cfg(windows)]
-    let _ = std::os::windows::fs::symlink_dir(modules, source_root.join("node_modules"));
+    {
+        let _ = if is_dir {
+            std::os::windows::fs::symlink_dir(target, link)
+        } else {
+            std::os::windows::fs::symlink_file(target, link)
+        };
+    }
 }
 
 fn find_tsgo() -> Option<PathBuf> {
@@ -362,4 +446,93 @@ fn find_tsgo() -> Option<PathBuf> {
         .collect();
     binaries.sort();
     binaries.pop()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn contract_methods(source: &str) -> Vec<String> {
+        let root = tempdir().unwrap();
+        let path = root.path().join("index.ts");
+        fs::write(&path, source).unwrap();
+        let mut contracts = Vec::new();
+        collect_candidates(&path, source, &mut contracts, &mut Vec::new()).unwrap();
+        contracts
+            .into_iter()
+            .map(|contract| contract.method)
+            .collect()
+    }
+
+    #[test]
+    fn treats_constrained_key_parameters_as_registry_contracts() {
+        let methods = contract_methods(
+            "type EventName = 'opened' | 'closed';
+            export interface Tracker {
+                track<Name extends EventName>(name: Name, payload: object): void;
+            }",
+        );
+
+        assert_eq!(methods, ["track"]);
+    }
+
+    #[test]
+    fn ignores_generic_methods_without_a_constrained_key_parameter() {
+        let methods = contract_methods(
+            "export interface Store {
+                load<T extends object>(id: string, options: object): T;
+                read<T extends string>(): T;
+                find<T extends string>(key: string, fallback: T): T;
+            }",
+        );
+
+        assert!(methods.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mirrors_workspace_node_modules_into_snapshots() {
+        let compiler = tempdir().unwrap();
+        let snapshot = tempdir().unwrap();
+        let compiler_root = compiler.path();
+        let snapshot_root = snapshot.path();
+
+        let store = compiler_root.join("node_modules/.pnpm/external@1.0.0/node_modules/external");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(compiler_root.join("packages/sibling")).unwrap();
+        let consumer_modules = compiler_root.join("packages/consumer/node_modules");
+        fs::create_dir_all(consumer_modules.join("@acme")).unwrap();
+        std::os::unix::fs::symlink("../../../sibling", consumer_modules.join("@acme/sibling"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../node_modules/.pnpm/external@1.0.0/node_modules/external",
+            consumer_modules.join("external"),
+        )
+        .unwrap();
+
+        let source = snapshot_root.join("packages/consumer/src/index.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "").unwrap();
+        fs::create_dir_all(snapshot_root.join("packages/sibling")).unwrap();
+
+        link_node_modules(snapshot_root, compiler_root, &[source]);
+
+        let snapshot_modules = snapshot_root.join("packages/consumer/node_modules");
+        assert_eq!(
+            snapshot_modules
+                .join("@acme/sibling")
+                .canonicalize()
+                .unwrap(),
+            snapshot_root
+                .join("packages/sibling")
+                .canonicalize()
+                .unwrap(),
+        );
+        assert_eq!(
+            snapshot_modules.join("external").canonicalize().unwrap(),
+            store.canonicalize().unwrap(),
+        );
+    }
 }
